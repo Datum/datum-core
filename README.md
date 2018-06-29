@@ -14,8 +14,8 @@ Holds the virtual balance for a user in Datum Blockchain for Storage or Marketpl
 # StorageContract
 Handles all storage related parts, like creating storage space, access rules on storage items, etc
 
-# StorageContract
-Handles all storage costs related parts
+# StorageCostsContract
+Handles the storage costs 
 
 # Marketplace
 Handles all the martketplace functions like adding data request, creating auctions, bid on auction, etc

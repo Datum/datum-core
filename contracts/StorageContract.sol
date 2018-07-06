@@ -4,6 +4,7 @@ import './lib/SafeMath.sol';
 import './shared/Ownable.sol';
 import './VaultManager.sol';
 import './NodeRegistrator.sol';
+import './StorageCostsContract.sol';
 
 
 /**
@@ -18,7 +19,8 @@ contract StorageNodeContract is Ownable {
 
     VaultManager public vault; //address of vault manager
     NodeRegistrator public registrator; //address of node registrator
-
+    StorageCostsContract public costsContract; //costs contract
+ 
 
     //block time is fix 5 seconds
     uint private monthInBlocks =  12 * 60 * 24 * 30;
@@ -29,33 +31,30 @@ contract StorageNodeContract is Ownable {
 
     //meta data about a storage item
     struct StorageItem {
+        address owner;
         bytes32 id;
+        bytes32 merkle;
+        uint256 size;
         bytes32 keyname;
         uint replicationMode;
         uint privacy;
         uint duration;
         uint createdAt;
+        bool exists;
     }
 
     struct StorageProof {
-        address owner;
+        address signer;
         bytes32 proof;
-        uint downloaded;
     }
 
-    mapping(address => mapping(bytes32 => bytes32[])) public storageKeys;
-    mapping(bytes32 => StorageItem) public storageItemMapping;
-    
-    bytes32[] public storageItemList;
 
-    mapping(address => bytes32[]) public storageItems;
-
-    //holds all public keys that have access to a given dataId
-    mapping(bytes32 => address[]) storageItemAccessList;
-
-    mapping(bytes32 => mapping(address => bytes)) storageItemCryptedSecrets;
-
-    mapping(bytes32 => address) public allowedStorageNodesForDataId;
+    StorageItem[] public items;
+    mapping(bytes32 => uint) public hashToIdMap;
+    mapping(bytes32 => address[]) public itemToAddressMap;
+    mapping(address => bytes32[]) public addressToItemMap;
+    mapping(bytes32 => mapping(address => bytes32[])) public keyToItemMap;
+    mapping(address => mapping(bytes32 => bytes)) secretsForUserMap;
 
     //hold the proof of storage node that a data is stored
     mapping(bytes32 => StorageProof[]) public storageProofs;
@@ -66,7 +65,7 @@ contract StorageNodeContract is Ownable {
     event StorageInitialized(address owner, bytes32 dataHash, uint256 amount);
 
     //Storage item added to contract
-    event StorageItemAdded(address owner, bytes32 id, uint replicationMode, uint privacy, uint duration);
+    event StorageItemAdded(address owner, bytes32 id);
 
     //storage item removed
     event StorageItemRemoved(bytes32 dataHash);
@@ -92,9 +91,12 @@ contract StorageNodeContract is Ownable {
     //event fired if deposit to storage contract
     event Deposit(address owner, uint256 amount);
 
+    event Withdrawal(address owner, uint256 amount);
+
     constructor() public {
         vault = new VaultManager();
-        registrator = new NodeRegistrator();
+        costsContract = new StorageCostsContract();
+        //registrator = new NodeRegistrator();
     }
 
 
@@ -114,6 +116,15 @@ contract StorageNodeContract is Ownable {
     function setRegistrator(address _registratorAddress) onlyOwner public 
     {
         registrator = NodeRegistrator(_registratorAddress);
+    }
+
+     /**
+     * @dev Allows the current owner to set a new costs contract.
+     * @param _costsContract The address of the deployed costs contract
+     */
+    function setCostsContract(address _costsContract) onlyOwner public 
+    {
+        costsContract = StorageCostsContract(_costsContract);
     }
 
 
@@ -136,6 +147,23 @@ contract StorageNodeContract is Ownable {
        emit Deposit(msg.sender, msg.value);
    }
 
+    /**
+   * @dev Withdrawal DATCoins to the Storage space
+   */
+   function withdrawal(uint256 amount) payable public {
+       //check if amount is valid
+       require(vault.getBalance(msg.sender) >= amount);
+
+       //substract from balance
+       vault.subtractBalance(msg.sender, msg.value);
+
+       //Send tokens
+       msg.sender.transfer(amount);
+
+        //fire event
+       emit Withdrawal(msg.sender, amount);
+   }
+
 
     /**
      * @dev Allows a party to add a data item to the contract.
@@ -145,9 +173,16 @@ contract StorageNodeContract is Ownable {
      * @param privacy The privacy level of the data , 1-3
      * @param duration The duration of the storage deal in days
      */
-    function initStorage(
-        bytes32 dataHash, bytes32 key, uint replicationMode,
-        uint privacy, uint duration) public payable returns (string) {
+    function setStorage(
+        bytes32 dataHash, 
+        bytes32 merkleRoot, 
+        bytes32 key, 
+        uint256 size,
+        uint duration,
+        uint replicationMode,
+        uint privacy, 
+        bytes secret
+    ) public payable {
 
         //check if the transaction contents a msg.value to fill the contract, if you make deposit
         if(msg.value != 0)
@@ -162,97 +197,85 @@ contract StorageNodeContract is Ownable {
         //TOD: calculate minimum of locked tockens needed for init the storage for this id
         require(vault.getBalance(msg.sender) >= storageRegisterDepositAmount);
 
-        //add msg.sender as main owner and first in access control list
-        storageItemAccessList[dataHash].push(msg.sender);
+        //check for costs
+        require(vault.getBalance(msg.sender) >= costsContract.getStorageCosts(size, duration));
 
-        //store storage items per public key
-        StorageItem memory item = StorageItem(dataHash, key, replicationMode,privacy,duration, block.number);
-        storageItemMapping[dataHash] = item;
-
-        //add to users storage item list
-        storageItems[msg.sender].push(dataHash);
-
-        //push to index array
-        storageItemList.push(dataHash);
-
-        //if key provided, add to key mapping
-        if(key != 0) {
-            //add key / id to mapping for user
-            storageKeys[msg.sender][key].push(dataHash);
-        }
-
+        //change balances to item
         //remove deposit amount from lockedamount and add to storage locked amounts
-        vault.subtractBalance(msg.sender, storageRegisterDepositAmount);
+        vault.subtractBalance(msg.sender, costsContract.getStorageCosts(size, duration));
         
         //add to storage locked balance       
-        vault.addStorageBalance(msg.sender, dataHash,  storageRegisterDepositAmount);
+        vault.addStorageBalance(msg.sender, dataHash,  costsContract.getStorageCosts(size, duration));
 
         //fire event
-        emit StorageInitialized(msg.sender, dataHash, storageRegisterDepositAmount);
+        emit StorageInitialized(msg.sender, dataHash, costsContract.getStorageCosts(size, duration));
+
+
+        //store storage items per public key
+        StorageItem memory item = StorageItem(msg.sender, dataHash, merkleRoot, size, key, replicationMode,privacy,duration, block.number, true);
+
+        // add item
+        items.push(item);
+        uint index = items.length -1;
+
+        //add different mappings
+        hashToIdMap[dataHash] = index;
+        itemToAddressMap[dataHash].push(msg.sender);
+        addressToItemMap[msg.sender].push(dataHash);
+        secretsForUserMap[msg.sender][dataHash] = secret;
+
+        if(key != 0x0) {
+            keyToItemMap[key][msg.sender].push(dataHash);
+        }
 
         //fire event
-        emit StorageItemAdded(msg.sender, dataHash, replicationMode, privacy, duration);
-
-        //TODO: get random node with criteria
-        address nodeAddrses = registrator.getRandomNode(block.number);
-        allowedStorageNodesForDataId[dataHash] = nodeAddrses;
-        string memory nodeEndpoint = registrator.getNodeEndpoint(nodeAddrses);
-
-        //fire event
-        emit StorageEndpointSelected(dataHash, nodeAddrses, nodeEndpoint);
-
-        //return storage node endpoint
-        return nodeEndpoint;
+        emit StorageItemAdded(msg.sender, dataHash);
     }
 
 
     /**
      * @dev Get locked balance in contract for given msg.sender
      */
-    function getLockedBalance() public view returns(uint256) {
-        return vault.getBalance(msg.sender);
+    function getDepositBalance(address wallet) public view returns(uint256) {
+        return vault.getBalance(wallet);
     }
 
     /**
-     * @dev Adds a new id to the keyspace
-     * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param key The key to add the id to
-     * @param clear flag if clear old entries and reset the key space
+     * @dev Get locked balance in contract for given msg.sender
      */
-    function setIdForKey(bytes32 dataHash, bytes32 key, bool clear) public {
-        //add new data hash to key space
-        if(key != 0) {
+    function getTotalLockedBalance(address wallet) public view returns(uint256) {
+        bytes32[] memory itemsForUser =  addressToItemMap[wallet];
 
-            //if clear requested, reset the complete array with id's for this keyname
-            if(clear) {
-                storageKeys[msg.sender][key] = new bytes32[](0);
-            }
-
-            //add key / id to mapping for user
-            storageKeys[msg.sender][key].push(dataHash);
-
-            //fire vent
-            emit StorageItemAddedToKeySpace(msg.sender, key, dataHash);
+        uint256 iTotal = 0;
+        for(uint i = 0; i < itemsForUser.length;i++) {
+            iTotal = iTotal + vault.getStorageBalance(wallet, itemsForUser[i]);
         }
+        return iTotal;
     }
 
-
-    /**
-     * @dev Allows a storage node to claim his rewards for a given data id
-     * @param dataHash The id of the data item, which represents the sha256 hash of content
+     /**
+     * @dev Get locked balance in contract for given msg.sender
      */
-     
+    function getLockedBalanceForId(address wallet, bytes32 dataHash) public view returns(uint256) {
+        return vault.getStorageBalance(wallet, dataHash);
+    }
+
+  
+    /*
     function claimStorageReward(bytes32 dataHash) public {
+        
+
         //only the storage node for this id can claim rewards
         require(allowedStorageNodesForDataId[dataHash] == msg.sender);
 
         //check if the storage deal is fullfilled
-        StorageItem memory item = storageItemMapping[dataHash];
+        
+        StorageItem memory item = items[hashToIdMap[dataHash]];
         uint blocksDuration = item.duration / 5;
         require((item.createdAt + blocksDuration) >= block.number);
 
         //get owner of storage item
-        address owner = storageItemAccessList[dataHash][0];
+        address owner = item.owner;
 
         //get amount locked for this storage item
         uint value = vault.getStorageBalance(owner, dataHash);
@@ -265,93 +288,97 @@ contract StorageNodeContract is Ownable {
 
         //fire event
         emit StorageNodeRewarded(dataHash, msg.sender, value);
+        
     }
+    */
     
 
     /**
      * @dev Allows the data owner to add another public key to ACL
      * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param publicKey The public key of the user that receives access
-     * @param encryptedSecret The encrypted secret for this public key (can be decrypted with his private key)
+     * @param wallet The public key of the user that receives access
+     * @param secret The encrypted secret for this public key (can be decrypted with his private key)
      */
      
-    function addStorageAccessKey(bytes32 dataHash, address publicKey, bytes encryptedSecret) public {
+    function addAccess(bytes32 dataHash, address wallet, bytes secret) public {
         //main owner of data item must be msg.sender
-        require(storageItemAccessList[dataHash][0] == msg.sender);
+        require(items[hashToIdMap[dataHash]].owner == msg.sender);
 
         //add the new publicKey that can access the data
-        storageItemAccessList[dataHash].push(publicKey);
-
-        //add encrypted secret for public key
-        storageItemCryptedSecrets[dataHash][publicKey] = encryptedSecret;
+        secretsForUserMap[wallet][dataHash] = secret;
+        addressToItemMap[wallet].push(dataHash);
+        itemToAddressMap[dataHash].push(wallet);
 
         //fire public event that key is added
-        emit StorageItemPublicKeyAdded(msg.sender, dataHash, publicKey);
+        emit StorageItemPublicKeyAdded(msg.sender, dataHash, wallet);
     }
 
 
      /**
      * @dev Allows the data owner to remove public key from ACL
      * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param publicKey The public key of the user that receives access
+     * @param wallet The public key of the user that receives access
      */
      
-    function removeStorageAccessKey(bytes32 dataHash, address publicKey) public {
+    function removeStorageAccessKey(bytes32 dataHash, address wallet) public {
         //main owner of data item must be msg.sender
-        require(storageItemAccessList[dataHash][0] == msg.sender);
+        require(items[hashToIdMap[dataHash]].owner == msg.sender);
 
+        //remove mappings
+        delete secretsForUserMap[wallet][dataHash];
 
-        uint i = 0;
-        while (storageItemAccessList[dataHash][i] != publicKey) {
-            i++;
-        }
-
-        while (i<storageItemAccessList[dataHash].length-1) {
-            storageItemAccessList[dataHash][i] = storageItemAccessList[dataHash][i+1];
-            i++;
-        }
-
-        storageItemAccessList[dataHash].length--;
-
-
-        //add encrypted secret for public key
-        delete storageItemCryptedSecrets[dataHash][publicKey];
+        removeFromAddressMapping(wallet, dataHash);
 
         //fire public event that key is added
-        emit StorageItemPublicKeyRemoved(msg.sender, dataHash, publicKey);
+        emit StorageItemPublicKeyRemoved(msg.sender, dataHash, wallet);
     }
     
+
+    function removeFromAddressMapping(address user, bytes32 item) public {
+
+        bytes32[] storage acl = addressToItemMap[user];
+        address[] storage aclInvert = itemToAddressMap[item];
+
+        uint i = 0;
+        while (acl[i] != item) {
+            i++;
+        }
+
+         while (i<acl.length-1) {
+            acl[i] = acl[i+1];
+            i++;
+        }
+        acl.length--;
+
+        i = 0;
+        while (aclInvert[i] != user) {
+            i++;
+        }
+
+         while (i<aclInvert.length-1) {
+            aclInvert[i] = aclInvert[i+1];
+            i++;
+        }
+        aclInvert.length--;
+    }
 
     /**
      * @dev Removes a data item from storage space
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      */
     function removeDataItem(bytes32 dataHash) public {
-        //main owner of data item must be msg.sender
-        require(storageItemAccessList[dataHash][0] == msg.sender);
+        //owner of data item must be msg.sender
+        require(items[hashToIdMap[dataHash]].owner == msg.sender);
 
-        //delete access list
-        delete storageItemAccessList[dataHash];
+        //delete item
+        delete items[hashToIdMap[dataHash]];
 
-        //delete from item list
-        delete storageItemMapping[dataHash];
+        //delete mappings
+        delete itemToAddressMap[dataHash];
+        delete addressToItemMap[msg.sender];
+        delete hashToIdMap[dataHash];
 
-        //push to index array
-        storageItemList.push(dataHash);
-
-        uint i = 0;
-        while (storageItems[msg.sender][i] != dataHash) {
-            i++;
-        }
-
-        while (i<storageItems[msg.sender].length-1) {
-            storageItems[msg.sender][i] = storageItems[msg.sender][i+1];
-            i++;
-        }
-
-        storageItems[msg.sender].length--;
-
-
+        //fire event
         emit StorageItemRemoved(dataHash);
     }
 
@@ -364,15 +391,15 @@ contract StorageNodeContract is Ownable {
      * @param r 
      * @param s 
      */
-    function addStorageProof(bytes32 dataHash, bytes32 signature, uint8 v, bytes32 r, bytes32 s, uint downloaded) public {
+    function addStorageProof(bytes32 dataHash, bytes32 signature, uint8 v, bytes32 r, bytes32 s) public {
         //verify signature is from msg.sender
         require(verify(signature, v, r, s, msg.sender));
 
         //verfiy id is related to msg.sender storage node
-        require(allowedStorageNodesForDataId[dataHash] == msg.sender);
+        //require(allowedStorageNodesForDataId[dataHash] == msg.sender);
 
         //add proof to list
-        storageProofs[dataHash].push(StorageProof(msg.sender,signature, downloaded));
+        storageProofs[dataHash].push(StorageProof(msg.sender,signature));
 
         //fire event
         emit StorageProofAdded(dataHash, msg.sender);
@@ -385,7 +412,7 @@ contract StorageNodeContract is Ownable {
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      */
     function getEncryptedSecret(bytes32 dataHash) public view returns(bytes) {
-        return storageItemCryptedSecrets[dataHash][msg.sender];
+        return secretsForUserMap[msg.sender][dataHash];
     }
 
 
@@ -393,27 +420,23 @@ contract StorageNodeContract is Ownable {
      * @dev Get count of storage items
      */
     function getStorageItemCount() public constant returns(uint entityCount) {
-        return storageItemList.length;
+        return items.length;
     }
 
     /**
      * @dev Check if the signed message has access to given data id
      * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param signedMessage The signed message
-     * @param v crypto values
-     * @param r crypto values
-     * @param s crypto values
+     * @param signer The signer address
      */
-    function canKeyAccessData(bytes32 dataHash, bytes32 signedMessage, uint8 v, bytes32 r, bytes32 s) public view returns(bool) {
+    function canKeyAccessData(bytes32 dataHash, address signer) public view returns(bool) {
         bool bCanAccess = false;
 
-        //recover signers public key
-        address addressFromSignedMessage = recoverAddress(signedMessage,v,r,s);
+        bytes32[] memory acl = addressToItemMap[signer];
 
         //check ACL if public key has access
-        for(uint i = 0; i < storageItemAccessList[dataHash].length;i++ )
+        for(uint i = 0; i < acl.length;i++ )
         {
-            if(storageItemAccessList[dataHash][i] == addressFromSignedMessage)
+            if(acl[i] == dataHash)
             {
                 bCanAccess = true;
             }
@@ -422,18 +445,11 @@ contract StorageNodeContract is Ownable {
     }
 
     /**
-     * @dev Check if a given public key can store data, if deposit is in vault manager
-     */
-    function canStoreData() public view returns (bool) {
-        return vault.getBalance(msg.sender) > 10;
-    }
-
-    /**
      * @dev Get array of all public keys that have access to this data tiem
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      */
     function getAccessKeysForData(bytes32 dataHash) public view returns (address[]) {
-        return storageItemAccessList[dataHash];
+        return itemToAddressMap[dataHash];
     }
 
     /**
@@ -441,7 +457,7 @@ contract StorageNodeContract is Ownable {
      * @param key the key name for the data id
      */
     function getIdsForKey(bytes32 key) public view returns (bytes32[]) {
-        return storageKeys[msg.sender][key];
+       return keyToItemMap[key][msg.sender];
     }
 
      /**
@@ -449,40 +465,60 @@ contract StorageNodeContract is Ownable {
      * @param key the key name for the data id
      */
     function getActualIdForKey(bytes32 key) public view returns (bytes32) {
-        return storageKeys[msg.sender][key][storageKeys[msg.sender][key].length -1];
+        
+        return keyToItemMap[key][msg.sender][keyToItemMap[key][msg.sender].length -1];
     }
 
     /**
      * @dev Get all data id's for given account
      */
-    function getIdsForAccount() public view returns (bytes32[]) {
-        return storageItems[msg.sender];
+    function getIdsForAccount(address wallet) public view returns (bytes32[]) {
+        return addressToItemMap[wallet];
     }
 
-    /**
-     * @dev Get all data id's exists in the contract
+
+     /**
+     * @dev Get all data id's for given account with given key
      */
-    function getAllIds() public view returns (bytes32[]) {
-        return storageItemList;
+    function getIdsForAccountByKey(address wallet, bytes32 key) public view returns(bytes32[]) {
+        return keyToItemMap[key][wallet];
     }
 
+ 
     /**
      * @dev Get specified storage item by given id
      */
-    function getItemForId(bytes32 id) public view returns (bytes32,bytes32,uint, uint , uint, uint) {
-      StorageItem memory item = storageItemMapping[id];
-      return (item.id, item.keyname, item.replicationMode, item.privacy, item.duration, item.createdAt);
+    function getItemForId(bytes32 dataHash) 
+        public 
+        constant 
+        returns (
+            address owner, 
+            bytes32 id,
+            bytes32 merkle ,
+            uint256 size, 
+            bytes32  keyname, 
+            uint replicationMode , 
+            uint privacy, 
+            uint duration,
+            uint createdAt,
+            bool exists) {
+    
+                uint index = hashToIdMap[dataHash];
+                StorageItem memory item = items[index];
+                return (
+                    item.owner,
+                    item.id, 
+                    item.merkle, 
+                    item.size,
+                    item.keyname, 
+                    item.replicationMode, 
+                    item.privacy, 
+                    item.duration, 
+                    item.createdAt,
+                    item.exists
+                );
     }
 
-    /**
-     * @dev Check if given public key can store given dataHash
-     * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param publicKey Public Key of the storage node
-     */
-    function canNodeStoreId(bytes32 dataHash, address publicKey) public view returns (bool)
-    {
-        return allowedStorageNodesForDataId[dataHash] == publicKey;
-    }
 
      /**
      * @dev Recover address from signed message

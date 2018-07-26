@@ -3,21 +3,25 @@ pragma solidity ^0.4.18;
 import './lib/SafeMath.sol';
 import './shared/Ownable.sol';
 import './VaultManager.sol';
+import './StorageContract.sol';
 
 
 contract MarketplaceContract is Ownable {
     using SafeMath for uint256;
 
 
-    bytes32[] hashes;
+    bytes32[] public hashes;
+
+    DataItem[] public items;
 
     VaultManager public vault; //address of vault manager
+    StorageNodeContract public storageContract; //address of storage contract
 
     //hold data items that are for sale for a given address
-    mapping(address => bytes32[]) dataItemsForAddress;
+    mapping(address => bytes32[]) public dataItemsForAddress;
 
     //hold all items to by id
-    mapping(bytes32 => DataItem) dataItems;
+    mapping(bytes32 => uint) public hashToIdMap;
 
     //hold data requests
     mapping(address => mapping(bytes32 => Request[])) dataRequests;
@@ -62,10 +66,14 @@ contract MarketplaceContract is Ownable {
     event Withdrawal(address id, uint256 amount);
 
     struct DataItem {
-        bytes32 dataHash;
         address owner;
-        uint amount;
-        uint timestamp;
+        bytes32 dataHash;
+        uint256 price;
+        bytes32 category;
+        bytes metadata;
+        bytes example;
+        uint duration;
+        bytes proof;
         bool exists;
     }
 
@@ -108,6 +116,14 @@ contract MarketplaceContract is Ownable {
     function setVaultManager(address _vaultManagerAddress) onlyOwner public 
     {
         vault = VaultManager(_vaultManagerAddress);
+    }
+
+        /**
+     * @dev Set the active storage 
+     */
+    function setStorage(address _storageAddress) onlyOwner public 
+    {
+        storageContract = StorageNodeContract(_storageAddress);
     }
 
 
@@ -183,39 +199,55 @@ contract MarketplaceContract is Ownable {
    /**
      * @dev Add a data item to the marketplace
      * @param id id of the data item
-     * @param amount min amount must be paid for this item
+     * @param price min amount must be paid for this item
      * @param duration blocks how long this item is active in marketplace
      */
-   function addDataItem(bytes32 id, uint amount, uint duration) public {
-       //add item to item list
-       dataItems[id] = DataItem(id, msg.sender, amount, duration, true);
+   function addDataItem(bytes32 id, uint price, bytes32 category, bytes metadata, bytes example,  uint duration, bytes proof) public {
+       //create struct
+        DataItem memory item = DataItem(msg.sender, id, price, category, metadata, example,  duration,proof, true);
+
+        // add item
+        items.push(item);
+        uint index = items.length -1;
+
+        //add mapping
+        hashToIdMap[id] = index;
+
+        hashes.push(id);
 
         //add item to msg.sender items
-       dataItemsForAddress[msg.sender].push(id);
+        dataItemsForAddress[msg.sender].push(id);
 
        //fire event
-       emit DataItemAdded(msg.sender, id, amount, duration);
+       emit DataItemAdded(msg.sender, id, price, duration);
    }
 
 
-   function buyDataItem(bytes32 id) public {
+   function buyDataItem(bytes32 id) public payable {
+       
+       if(msg.value != 0) {
+            vault.addBalance(msg.sender, msg.value);
+
+            emit Deposit(msg.sender, msg.value);
+       }
+
        //item must exists
-       require(dataItems[id].exists == true);
+       require(items[hashToIdMap[id]].exists == true);
 
        //user must have enough balance to buy
-       require(vault.getBalance(msg.sender) >= dataItems[id].amount);
+       require(vault.getBalance(msg.sender) >= items[hashToIdMap[id]].price);
 
        //remove buyer balance
-       vault.subtractBalance(msg.sender, dataItems[id].amount);
+       vault.subtractBalance(msg.sender, items[hashToIdMap[id]].price);
 
        //add owner balance
-       vault.addBalance(dataItems[id].owner, dataItems[id].amount);
+       vault.addBalance(items[hashToIdMap[id]].owner,  items[hashToIdMap[id]].price);
 
         //add item to new owner items
         dataItemsForAddress[msg.sender].push(id);
 
         //fire event
-        emit DataItemTraded(dataItems[id].owner, msg.sender,id , dataItems[id].amount );
+        emit DataItemTraded( items[hashToIdMap[id]].owner, msg.sender,id , items[hashToIdMap[id]].price );
 
    }
 
@@ -338,4 +370,44 @@ contract MarketplaceContract is Ownable {
         emit AuctionClosed(id, msg.sender,  lastBid.owner, lastBid.amount);
 
    }
+
+    /**
+    * @dev Get all data id's that are for sale
+    */
+    function getItemIdsForSale() public view returns(bytes32[]) {
+        return hashes;
+    }
+
+    /**
+     * @dev Get specified storage item by given id
+     */
+    function getItemForId(bytes32 dataHash)
+    public
+    constant
+    returns (
+        address owner,
+        bytes32 id,
+        uint amount,
+        bytes32 category,
+        bytes metadata,
+        bytes example,
+        uint duration,
+        bytes proof,
+        bool exists) {
+
+      
+        uint index = hashToIdMap[dataHash];
+        DataItem memory item = items[index];
+        return (
+        item.owner,
+        item.dataHash,
+        item.price,
+        item.category,
+        item.metadata,
+        item.example,
+        item.duration,
+        item.proof,
+        item.exists
+        );
+    }
 }

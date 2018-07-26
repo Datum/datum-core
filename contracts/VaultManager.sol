@@ -24,19 +24,7 @@ contract VaultManager is Operator {
     }
 
 
-    /**
-     * @dev Allows the user to withdrawal from his vault
-     * @param _value Amount to withdrawal
-     */
-    function transfer(uint256 _value) onlyOperator public  {
-        require (lockedAmounts[msg.sender] >= _value);
-
-        lockedAmounts[msg.sender] = lockedAmounts[msg.sender].sub(_value);
-
-        msg.sender.transfer(_value);
-    }
-
-    /**
+     /**
      * @dev Get Balance for address
      * @param _address public key address
      */

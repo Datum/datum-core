@@ -1,18 +1,24 @@
 const web3 = global.web3;
 const NodeRegistrator = artifacts.require('NodeRegistrator');
 const VaultManager = artifacts.require('VaultManager');
+const ForeverStorage = artifacts.require('ForeverStorage');
 
 contract('NodeRegistrator', function (accounts) {
     let registrator;
     let vault;
-    let depositAmount = 10;
+    let depositAmount = 1;
+    let storageSize = 1024 * 1024 * 1024;
     let endpoint = 'http://test/api';
+    let endpointDatum = 'http://node1.datum.org';
+    let endpointDatumWrong = 'http://node1-datum.org';
     let Regions = {
         AMERICA : 0,
         EUROPE : 1,
         ASIA : 2,
         AUSTRALIA : 3,
-        AFRICA : 4
+        AFRICA : 4,
+        RUSSIA : 5,
+        CHINA : 6
     }
     let Bandwidths = {
         LOW : 0,
@@ -20,43 +26,13 @@ contract('NodeRegistrator', function (accounts) {
         HIGH : 2
     }
 
-     //create new smart contract instance before each test method
-    beforeEach(async function () {
+     //create new smart contract instance before all tests
+    before(async function () {
         registrator = await NodeRegistrator.new();
-    });
+        foreverStorage = await ForeverStorage.new();
 
-
-    it("set vault manager from owner", async function () {
-        //create new vault
-        let newVault = await VaultManager.new();
-
-        //set vault
-        let result = await registrator.setVaultManager(newVault.address, { from: accounts[0] });
-
-        //read vault from contract
-        let contractVault = await registrator.vault.call();
-
-        //check if new adddres correctly set
-        assert.equal(contractVault, newVault.address, "Expected vault set to new vault")
-    });
-
-    it("set vault manager from other address (should fail)", async function () {
-
-        let addError;
-
-        try {
-            //create new vault
-            vault = await VaultManager.new();
-            let result = await registrator.setVaultManager(vault.address, { from: accounts[1] });
-        } catch (error) {
-            addError = error;
-        }
-
-        //read vault from contract
-        let newAddress = await registrator.vault.call();
-      
-        assert.notEqual(addError, undefined, 'Error must be thrown');
-        assert.notEqual(newAddress, vault.address, "Expected vault set to new vault")
+        await foreverStorage.addAdmin(registrator.address);
+        await registrator.setStorage(foreverStorage.address);
     });
 
 
@@ -65,53 +41,54 @@ contract('NodeRegistrator', function (accounts) {
         let bandwidth = Bandwidths.MEDIUM;
 
         let result = await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0], value: web3.toWei(depositAmount, 'ether') });
-        let nodeStruct = await registrator.registeredNodes.call(accounts[0]);
+        let nodeStruct = await registrator.getNodeInfo.call(accounts[0]);
        
-        assert.equal(result.logs[0].event, "NodeRegistered", "Expected NodeRegistered event")
+        assert.equal(result.logs[1].event, "NodeRegistered", "Expected NodeRegistered event")
         assert.equal(nodeStruct[0], endpoint);
         assert.equal(nodeStruct[1], bandwidth);
         assert.equal(nodeStruct[2], region);
-        
+        assert.equal(nodeStruct[3], "active");
     });
 
 
-    it("register storage node providing NO deposit", async function () {
+    it("Re-register storage node providing no deposit", async function () {
+        //change bandwith now and re-register without providing deposit
+        let region = Regions.EUROPE;
+        let bandwidth = Bandwidths.HIGH;
+
+        result = await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0] });
+        nodeStruct = await registrator.getNodeInfo.call(accounts[0]);
+
+
+        assert.equal(result.logs[0].event, "NodeUpdated", "Expected StorageNodeRegistered event")
+        assert.equal(nodeStruct[1], bandwidth);
+    });
+
+    it("check count", async function () {
+        let region = Regions.EUROPE;
+        let bandwidth = Bandwidths.MEDIUM;
+
+        await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0], value: web3.toWei(depositAmount, 'ether') });
+        let nodeCount = await registrator.getNodeCount();
+       
+        assert.equal(nodeCount.toNumber(), 1, "node count should be 1")
+    });
+
+    it("start unregister", async function () {
+        await registrator.unregisterNodeStart({ from: accounts[0] });
+        let nodeStatus = await registrator.getNodeStatus(accounts[0]);
+        assert.equal(nodeStatus, "unregister", "node should be in unregister status");
+    });
+
+    it("fullfill unregister (should fail)", async function () {
         let addError;
 
         try {
-            //create new vault
-            let region = Regions.EUROPE;
-            let bandwidth = Bandwidths.MEDIUM;
-            let result = await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0] });
+            await registrator.unregisterNode({ from: accounts[0] });
         } catch (error) {
             addError = error;
         }
 
         assert.notEqual(addError, undefined, 'Error must be thrown');
-    });
-
-    it("Re-register storage node providing no deposit", async function () {
-        let region = Regions.EUROPE;
-        let bandwidth = Bandwidths.MEDIUM;
-
-        let result = await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0], value: web3.toWei(depositAmount, 'ether') });
-        let nodeStruct = await registrator.registeredNodes.call(accounts[0]);
-
-        
-        assert.equal(result.logs[0].event, "NodeRegistered", "Expected StorageNodeRegistered event")
-        assert.equal(nodeStruct[0], endpoint);
-        assert.equal(nodeStruct[1], bandwidth);
-        assert.equal(nodeStruct[2], region);
-
-
-        //change bandwith now and re-register without providing deposit
-        bandwidth = Bandwidths.HIGH;
-
-        result = await registrator.registerNode(endpoint, bandwidth, region, { from: accounts[0] });
-        nodeStruct = await registrator.registeredNodes.call(accounts[0]);
-
-        
-        assert.equal(result.logs[0].event, "NodeRegistered", "Expected StorageNodeRegistered event")
-        assert.equal(nodeStruct[1], bandwidth);
     });
 });

@@ -7,6 +7,7 @@ pragma solidity ^0.4.23;
 contract DatumRegistry{
   
     mapping(address => mapping(address => mapping(bytes32 => bytes32))) public registry;
+    mapping(address => mapping(address => mapping(bytes32 => address))) public registrySigner;
 
     event ClaimSet(
         address indexed issuer,
@@ -21,21 +22,27 @@ contract DatumRegistry{
         bytes32 indexed key,
         uint removedAt);
 
+
+
+
     /// @dev Create or update a claim
     /// @param subject The address the claim is being issued to
     /// @param key The key used to identify the claim
     /// @param value The data associated with the claim
-    function setClaim(address subject, bytes32 key, bytes32 value) public {
+    function setClaim(address subject, bytes32 key, bytes32 value, bytes32 msgHash, uint8 v, bytes32 r, bytes32 s) public {
+        address signer = recoverAddr(msgHash, v, r,s);
         registry[msg.sender][subject][key] = value;
+        registrySigner[msg.sender][subject][key] = signer;
         emit ClaimSet(msg.sender, subject, key, value, now);
     }
 
     /// @dev Create or update a claim about yourself
     /// @param key The key used to identify the claim
     /// @param value The data associated with the claim
-    function setSelfClaim(bytes32 key, bytes32 value) public {
-        setClaim(msg.sender, key, value);
+    function setSelfClaim(bytes32 key, bytes32 value, bytes32 msgHash, uint8 v, bytes32 r, bytes32 s) public {
+        setClaim(msg.sender, key, value,msgHash, v,r,s);
     }
+
 
     /// @dev Allows to retrieve claims from other contracts as well as other off-chain interfaces
     /// @param issuer The address of the issuer of the claim
@@ -43,6 +50,18 @@ contract DatumRegistry{
     /// @param key The key used to identify the claim
     function getClaim(address issuer, address subject, bytes32 key) public constant returns(bytes32) {
         return registry[issuer][subject][key];
+    }
+
+    /// @dev Verifiy a claim that the issuer has also signed the claim
+    /// @param issuer The address of the issuer of the claim
+    /// @param subject The address to which the claim was issued to
+    /// @param key The key used to identify the claim
+    function verifyClaim(address issuer, address subject, bytes32 key) public constant returns (bool) {
+        return registrySigner[issuer][subject][key] == issuer;
+    }
+
+    function getSigner(address issuer, address subject, bytes32 key) public constant returns(address) {
+        return registrySigner[issuer][subject][key];
     }
 
 
@@ -56,5 +75,10 @@ contract DatumRegistry{
         require(registry[issuer][subject][key] != 0);
         delete registry[issuer][subject][key];
         emit ClaimRemoved(msg.sender, subject, key, now);
+    }
+
+
+    function recoverAddr(bytes32 msgHash, uint8 v, bytes32 r, bytes32 s) public pure returns (address) {
+        return ecrecover(msgHash, v, r, s);
     }
 }

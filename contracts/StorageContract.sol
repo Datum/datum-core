@@ -5,7 +5,8 @@ import './shared/Ownable.sol';
 import './shared/Pausable.sol';
 import './VaultManager.sol';
 import './NodeRegistrator.sol';
-import './StorageCostsContract.sol';
+import './ForeverStorage.sol';
+
 
 
 /**
@@ -20,58 +21,23 @@ contract StorageNodeContract is Pausable {
 
     VaultManager public vault; //address of vault manager
     NodeRegistrator public registrator; //address of node registrator
-    StorageCostsContract public costsContract; //costs contract
-
-
-    //block time is fix 5 seconds
-    uint private monthInBlocks =  12 * 60 * 24 * 30;
+    ForeverStorage private foreverStorage; //shared data storage
 
     //storage costs in test version fix depending on size, ~5$/GB per month, --> 1 DAT = 0.023 --> ~217 DATCoins/GB per month
     //set default min deposit amount, 1 ether = 1 DATCoins, which allow ~4.6MB per month stored
     uint public storageRegisterDepositAmount = 10000000000000000 wei;
 
-    //meta data about a storage item
-    struct StorageItem {
-        address creator;
-        address owner;
-        bytes32 id;
-        bytes32 merkle;
-        uint256 size;
-        bytes32 keyname;
-        uint replicationMode;
-        uint privacy;
-        uint duration;
-        uint createdAt;
-        bool exists;
-    }
-
-    //define param (isPaused) to decide availability of this version smart contract
-    //isPaused = false : all functions are callable by Datum SDK and will return normal response
-    //isPaused = true  : all functions will return "This version had been deprecated, Please upgrade Datum SDK npm package" about calling from SDK
-
-    StorageItem[] public items;
-    mapping(bytes32 => uint) public hashToIdMap;
-    mapping(bytes32 => address[]) public itemToAddressMap;
-    mapping(address => bytes32[]) public addressToItemMap;
-    mapping(bytes32 => mapping(address => bytes32[])) public keyToItemMap;
-    mapping(bytes32 => bytes) secretsMap;
-
-    mapping(bytes32 => address) deletedMapping;
-
-    //Storage "deal" created with amount holded in contract
-    event StorageInitialized(address owner, bytes32 dataHash, uint256 amount);
-
     //Storage item added to contract
-    event StorageItemAdded(address owner, bytes32 id);
+    event StorageItemAdded(address indexed sender, address indexed owner, bytes32 id);
 
     //storage item removed
     event StorageItemRemoved(bytes32 dataHash);
 
     //Public Key added to access list
-    event StorageItemPublicKeyAdded(address owner, bytes32 dataHash, address publicKey);
+    event StorageItemPublicKeyAdded(address indexed owner, bytes32 indexed dataHash, address indexed publicKey);
 
     //public Key removed from access list
-    event StorageItemPublicKeyRemoved(address owner, bytes32 dataHash, address publicKey);
+    event StorageItemPublicKeyRemoved(address indexed owner, bytes32 indexed dataHash, address indexed publicKey);
 
     //event if a storage node claim his rewards
     event StorageNodeRewarded(bytes32 dataHash, address storageNode, uint256 value);
@@ -81,11 +47,13 @@ contract StorageNodeContract is Pausable {
 
     event Withdrawal(address owner, uint256 amount);
 
+    event StorageProofNeeded(address indexed storageNode, bytes32 indexed dataHash, uint chunkIndex);
+    
+    event StorageNodesSelected(bytes32 dataHash, address addresses);
 
-    constructor(address _vault, address _costs) public {
+    constructor(address _vault, address _registrator) public {
         vault = VaultManager(_vault);
-        costsContract = StorageCostsContract(_costs);
-        //registrator = new NodeRegistrator();
+        registrator = NodeRegistrator(_registrator);
     }
 
 
@@ -107,16 +75,15 @@ contract StorageNodeContract is Pausable {
         registrator = NodeRegistrator(_registratorAddress);
     }
 
-    /**
-    * @dev Allows the current owner to set a new costs contract.
-    * @param _costsContract The address of the deployed costs contract
+
+     /**
+    * @dev Allows the current owner to set a storage contract (gandalf)
+    * @param _foreverStorage The address of the deployed costs contract
     */
-    function setCostsContract(address _costsContract) onlyOwner whenNotPaused public
+    function setStorageContract(address _foreverStorage) onlyOwner public
     {
-        costsContract = StorageCostsContract(_costsContract);
+        foreverStorage = ForeverStorage(_foreverStorage);
     }
-
-
 
     /**
      * @dev Allows the current operator to set a new storageDepositAmount.
@@ -125,8 +92,6 @@ contract StorageNodeContract is Pausable {
     function setStorageDepositAmount(uint amount) onlyOwner whenNotPaused public {
         storageRegisterDepositAmount = amount;
     }
-
-
 
     /**
     * @dev Deposit DATCoins to the Storage space
@@ -141,11 +106,13 @@ contract StorageNodeContract is Pausable {
    * @dev Withdrawal DATCoins to the Storage space
    */
     function withdrawal(address sender, uint256 amount) whenNotPaused payable public {
+        require(msg.sender == sender, "Only allow original signer of transactions to withdrawal to address");
+
         //check if amount is valid
-        require(vault.getBalance(sender) >= amount);
+        require(vault.getBalance(sender) >= amount, "requested withdrawal amount is higher than balance");
 
         //substract from balance
-        vault.subtractBalance(sender, msg.value);
+        vault.subtractBalance(sender, amount);
 
         //Send tokens
         sender.transfer(amount);
@@ -156,72 +123,209 @@ contract StorageNodeContract is Pausable {
    
     /**
      * @dev Allows a party to add a data item to the contract.
-     * @param sender The owner of the data
+     * @param owner The owner of the data
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      * @param merkleRoot root the root hash of the merkle tree
      * @param key The keyname used for this item
-     * @param size The size of data in bytes
-     * @param duration The duration of the storage deal in days     
+     * @param size The size of data in bytes   
      * @param replicationMode The replication mode of the data, 1-100
-     * @param privacy The privacy level of the data , 1-3
+     * @param trusted list of wallets that have access
      */
     function setStorage(
-        address sender,
+        address owner,
         bytes32 dataHash,
         bytes32 merkleRoot,
         bytes32 key,
         uint256 size,
-        uint256 duration,
         uint256 replicationMode,
-        uint256 privacy,
-        bytes secret
-    )  public payable {
+        address[] trusted
+    )  public payable returns(address[]) {
 
+
+        //if msg.value is provided, add to balance
         if(msg.value > 0) {
-            vault.addBalance(sender, msg.value);
-
-            emit Deposit(msg.sender, sender, msg.value);
+            vault.addBalance(msg.sender, msg.value);
+            emit Deposit(msg.sender, msg.sender, msg.value);
         }
-
+        
         //TOD: calculate minimum of locked tockens needed for init the storage for this id
-        require(vault.getBalance(sender) >= storageRegisterDepositAmount);
+        require(vault.getBalance(msg.sender) >= storageRegisterDepositAmount, "your deposit doens't must match the minimum deposit amount" );
 
         //check for costs
-        require(vault.getBalance(sender) >= costsContract.getStorageCosts(size, duration));
+        //require(vault.getBalance(msg.sender) >= storageCosts, "your deposit amount must contents at least the storage costs for 1 day");
 
-        //change balances to item
-        //remove deposit amount from lockedamount and add to storage locked amounts
-        vault.subtractBalance(sender, costsContract.getStorageCosts(size, duration));
+        //set storage
+        foreverStorage.setAddressByBytes32(keccak256(dataHash, "StorageItemCreator"), msg.sender);
+        foreverStorage.setAddressByBytes32(keccak256(dataHash, "StorageItemOwner"), owner);
+        foreverStorage.setBytes32ByBytes32(keccak256(dataHash, "StorageItemHash"), dataHash);
+        foreverStorage.setBytes32ByBytes32(keccak256(dataHash, "StorageItemMerkleRoot"), merkleRoot);
+        foreverStorage.setUintByBytes32(keccak256(dataHash, "StorageItemSize"), size);
+        foreverStorage.setUintByBytes32(keccak256(dataHash, "StorageItemCreated"), now);
+        foreverStorage.setBytes32ByBytes32(keccak256(dataHash, "StorageItemKey"), key);
+        foreverStorage.setUintByBytes32(keccak256(dataHash, "StorageItemReplicationMode"), replicationMode);
 
-        //add to storage locked balance
-        vault.addStorageBalance(sender, dataHash,  costsContract.getStorageCosts(size, duration));
-
-        //fire event
-        emit StorageInitialized(sender, dataHash, costsContract.getStorageCosts(size, duration));
+        //update counts
+        uint storageItemCount = foreverStorage.getUintByBytes32(keccak256("StorageItemCount"));
+        foreverStorage.setUintByBytes32(keccak256("StorageItemCount"), storageItemCount.add(1));
 
 
-        //store storage items per public key
-        StorageItem memory item = StorageItem(msg.sender,sender, dataHash, merkleRoot, size, key, replicationMode,privacy,duration, block.number, true);
-
-        // add item
-        items.push(item);
-        uint index = items.length -1;
-
-        //add different mappings
-        hashToIdMap[dataHash] = index;
-        itemToAddressMap[dataHash].push(sender);
-        addressToItemMap[sender].push(dataHash);
-        secretsMap[dataHash] = secret;
-
-        if(key != 0x0) {
-            keyToItemMap[key][sender].push(dataHash);
+        //set trusted addresses
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"), owner);
+        foreverStorage.setBytes32ArrayByAddress(owner, dataHash);
+        for(uint i =0; i < trusted.length;i++) {
+            foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"), trusted[i]);
         }
 
+        //set mappings and key mappings
+        foreverStorage.setBytes32ArrayByBytes32(keccak256(owner, "StorageItemsForOwner"), dataHash);
+        if(key != 0x0) {
+            foreverStorage.setBytes32ArrayByBytes32(keccak256(owner, key, "StorageItemsForKey"), dataHash);
+        }
+        
         //fire event
-        emit StorageItemAdded(sender, dataHash);
+        emit StorageItemAdded(msg.sender, owner, dataHash);
+
+        //get storage nodes
+        address[] memory a = new address[](3);
+        a[0] = registrator.getRandomNode(now);
+        a[1] = registrator.getRandomNode(now + 10);
+        //try to get different nodes
+        uint exitCount = 1;
+        while(exitCount < 10) {
+            a[2] = registrator.getRandomNode(now + exitCount);
+            if(a[2] != a[1]) break;
+            exitCount++;
+        }
+
+        //set as target nodes and inverse mappings
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"), a[0]);
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"), a[1]);
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"), a[2]);
+        foreverStorage.setBytes32ArrayByBytes32(keccak256(a[0], "ItemsForNode"), dataHash);
+        foreverStorage.setBytes32ArrayByBytes32(keccak256(a[1], "ItemsForNode"), dataHash);
+        foreverStorage.setBytes32ArrayByBytes32(keccak256(a[1], "ItemsForNode"), dataHash);
+
+        //fire events
+        emit StorageNodesSelected(dataHash, a[0]);
+        emit StorageNodesSelected(dataHash, a[1]);
+        emit StorageNodesSelected(dataHash, a[2]);
+
+        return a;
+    }
+
+    //force a storage node to proof that it really stored the data with given hash
+    function forceStorageProof(bytes32 dataHash, address storageNode) public {
+
+        //check if given storageNode is responsible for given dataHash
+        address[] memory nodes = foreverStorage.getAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"));
+        bool bResponsible = false;
+        for(uint i = 0; i < nodes.length;i++) {
+            if(nodes[i] == storageNode) {
+                bResponsible = true;
+                break;
+            }
+        }
+        
+        require(bResponsible, "storageNode is node responsible for this item");
+
+        //select random chunk index from data stored, should return pseudo random number;
+        uint randomChunk = uint(keccak256(block.timestamp))%32;
+
+        //set storage
+        foreverStorage.setUintByBytes32(keccak256(dataHash, storageNode, "StorageProofRequestTimestamp"), now);
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, storageNode, "StorageProofRequestCreator"), msg.sender);
+        foreverStorage.setUintByBytes32(keccak256(dataHash, storageNode, "StorageProofRequestChunk"), randomChunk);
+        foreverStorage.setBytes32ArrayByBytes32(keccak256(storageNode, "StorageProofsForAddress"), dataHash);
+
+        //Fire event that can be checked by storage nodes
+        emit StorageProofNeeded(storageNode, dataHash, randomChunk);
+
+    }
+
+    //update the status for given storage node 
+    function setWorkStatusOnStorageProof(bytes32 dataHash) public {
+        foreverStorage.setBoolByBytes32(keccak256(dataHash, msg.sender,  "StorageProofWorkStatus"), true);
+    }
+
+    //adds access to another address for given item
+    function addAccess(bytes32 dataHash, address wallet) public returns(bool success) {
+        //only owner can add/remove access
+        require(foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemOwner")) == msg.sender, "Only owner can change access rules");
+
+        //set new address as trusted
+        foreverStorage.setAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"), wallet);
+
+        //fire event
+        emit StorageItemPublicKeyAdded(msg.sender, dataHash, wallet);
+
+        return true;
+    }
+
+    //removes access of wallet for a given item
+    function removeAccess(bytes32 dataHash,address wallet) whenNotPaused public returns(bool success) {
+        //only owner can add/remove access
+        require(foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemOwner")) == msg.sender, "Only owner can change access rules");
+
+        //set new address as trusted
+        foreverStorage.deleteAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"), wallet);
+
+        //fire event
+        emit StorageItemPublicKeyRemoved(msg.sender, dataHash, wallet);
+
+        return true;
     }
 
 
+    //called from storage node to collect rewards
+    function collectRewards() public {
+        //get all hashes stored by this node
+        bytes32[] memory hashes = foreverStorage.getBytes32ArrayByBytes32(keccak256(msg.sender, "ItemsForNode"));
+
+        //go trough all and calculate rewards / check for storage proofs
+        for(uint i = 0; i < hashes.length;i++) {
+
+            //last paid
+            uint lastPaid = foreverStorage.getUintByBytes32(keccak256(msg.sender, hashes[i], "StorageItemLastPaid")); 
+            uint itemCreatedAt = foreverStorage.getUintByBytes32(keccak256(hashes[i], "StorageItemCreated"));
+            uint256 itemSize = foreverStorage.getUintByBytes32(keccak256(hashes[i], "StorageItemSize"));
+
+            //calculate time to be payed for
+            uint timeToBePaidInSeconds = now.sub(itemCreatedAt).sub(lastPaid);
+
+            //storage costs for  1 day for 1 byte
+            uint256 costs = 500000000000000 wei;
+            uint256 costsBytePerDay = costs.div(1024).div(30);
+            uint256 costsItemPerDay = costsBytePerDay.mul(itemSize);
+
+            //calculate real costs/reward
+            uint256 realCosts = costsItemPerDay.mul(timeToBePaidInSeconds).div(24).div(60).div(60);
+            
+            //get the address that makes the deposit for this item
+            address depositer = foreverStorage.getAddressByBytes32(keccak256(hashes[i], "StorageItemCreator"));
+
+            //check if enough balance is there
+            if(vault.getBalance(depositer) >= realCosts) {
+                vault.subtractBalance(depositer, realCosts);
+                vault.addBalance(msg.sender, realCosts);
+                emit StorageNodeRewarded(hashes[i], msg.sender, realCosts);
+
+            } else {
+                //get total amount exists on balance and delete item
+                uint256 depositerAmount = vault.getBalance(depositer);
+                vault.subtractBalance(depositer,depositerAmount);
+                vault.addBalance(msg.sender, depositerAmount);
+                removeDataItem(hashes[i]);
+
+                emit StorageNodeRewarded(hashes[i], msg.sender, depositerAmount);
+            }
+
+            
+            //set last paid date for this item
+            foreverStorage.setUintByBytes32(keccak256(msg.sender, hashes[i], "StorageItemLastPaid"), now); 
+        }
+    }
+
+    
     /**
      * @dev Get locked balance in contract for given msg.sender
      */
@@ -229,75 +333,17 @@ contract StorageNodeContract is Pausable {
         return vault.getBalance(wallet);
     }
 
-    /**
-     * @dev Get locked balance in contract for given msg.sender
-     */
-    function getTotalLockedBalance(address wallet) public view returns(uint256) {
-        bytes32[] memory itemsForUser =  addressToItemMap[wallet];
-
-        uint256 iTotal = 0;
-        for(uint i = 0; i < itemsForUser.length;i++) {
-            iTotal = iTotal + vault.getStorageBalance(wallet, itemsForUser[i]);
-        }
-        return iTotal;
-    }
-
-    /**
-    * @dev Get locked balance in contract for given msg.sender
-    */
-    function getLockedBalanceForId(address wallet, bytes32 dataHash) public view returns(uint256) {
-        return vault.getStorageBalance(wallet, dataHash);
-    }
-
-
-
-
-    function removeFromAddressMapping(address user, bytes32 item) whenNotPaused public {
-        bytes32[] storage acl = addressToItemMap[user];
-        address[] storage aclInvert = itemToAddressMap[item];
-
-        uint i = 0;
-        while (acl[i] != item) {
-            i++;
-        }
-
-        while (i<acl.length-1) {
-            acl[i] = acl[i+1];
-            i++;
-        }
-        acl.length--;
-
-        i = 0;
-        while (aclInvert[i] != user) {
-            i++;
-        }
-
-        while (i<aclInvert.length-1) {
-            aclInvert[i] = aclInvert[i+1];
-            i++;
-        }
-        aclInvert.length--;
-    }
-
      /**
      * @dev Removes a data item from storage space
      * @param keyname The key of the data items
      */
-    function removeKey(address sender, bytes32 keyname) whenNotPaused public {
-
-        bytes32[] memory itemList = keyToItemMap[keyname][sender];
-
-        for(uint i = 0; i < itemList.length;i++ )
+    function removeKey(bytes32 keyname) whenNotPaused public returns(bool success) {
+        bytes32[] memory items = getIdsForKey(keyname);
+        for(uint i = 0;i < items.length;i++) 
         {
-            //remove only items where msg.sender is the owner
-           if(items[hashToIdMap[itemList[i]]].owner == sender)
-           {
-                removeDataItem(sender, itemList[i]);
-           }
+            removeDataItem(items[i]);
         }
-
-        //delete key for msg.sender
-        delete keyToItemMap[keyname][sender];
+        return true;
     }
 
 
@@ -305,42 +351,36 @@ contract StorageNodeContract is Pausable {
      * @dev Removes a data item from storage space
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      */
-    function removeDataItem(address sender, bytes32 dataHash) whenNotPaused public {
-        //owner of data item must be msg.sender
-        require(items[hashToIdMap[dataHash]].owner == sender);
+    function removeDataItem(bytes32 dataHash) whenNotPaused public returns(bool) {
+        require(foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemOwner")) == msg.sender, "Only owner can remove item");
+        
+        //remove storages
+        foreverStorage.deleteAddressByBytes32(keccak256(dataHash, "StorageItemCreator"));
+        foreverStorage.deleteAddressByBytes32(keccak256(dataHash, "StorageItemOwner"));
+        foreverStorage.deleteBytes32ByBytes32(keccak256(dataHash, "StorageItemHash"));
+        foreverStorage.deleteBytes32ByBytes32(keccak256(dataHash, "StorageItemMerkleRoot"));
+        foreverStorage.deleteUintByBytes32(keccak256(dataHash, "StorageItemSize"));
+        foreverStorage.deleteUintByBytes32(keccak256(dataHash, "StorageItemCreated"));
+        foreverStorage.deleteBytes32ByBytes32(keccak256(dataHash, "StorageItemKey"));
+        foreverStorage.deleteUintByBytes32(keccak256(dataHash, "StorageItemReplicationMode"));
 
-        //delete item
-        delete items[hashToIdMap[dataHash]];
 
-        //delete mappings
-        //delete itemToAddressMap[dataHash];
-        //delete addressToItemMap[msg.sender];
-        removeFromAddressMapping(sender, dataHash);
+        //update count
+        uint storageItemCount = foreverStorage.getUintByBytes32(keccak256("StorageItemCount"));
+        foreverStorage.setUintByBytes32(keccak256("StorageItemCount"), storageItemCount.sub(1) );
 
-        delete hashToIdMap[dataHash];
+
+        //remove array storages
+        foreverStorage.deleteAllAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"));
+        foreverStorage.deleteBytes32ArrayByBytes32(keccak256(msg.sender, "StorageItemsForOwner"), dataHash);
+
+        //removenodes
+        foreverStorage.deleteAllAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"));
 
         //fire event
         emit StorageItemRemoved(dataHash);
 
-        //add historic
-        deletedMapping[dataHash] =  sender;
-    }
-
-
-
-     /**
-     * @dev check if wallet was deleter.
-     */
-    function hasDeletedItem(address wallet, bytes32 id) public view returns (bool) {
-       return deletedMapping[id] == wallet;
-    }
-
-    /**
-     * @dev Read the public secret for given data if and msg.sender
-     * @param dataHash The id of the data item, which represents the sha256 hash of content
-     */
-    function getEncryptedSecret(bytes32 dataHash) public view returns(bytes) {
-        return secretsMap[dataHash];
+        return true;
     }
 
 
@@ -348,28 +388,38 @@ contract StorageNodeContract is Pausable {
      * @dev Get count of storage items
      */
     function getStorageItemCount() public constant returns(uint entityCount) {
-        return items.length;
+        return foreverStorage.getUintByBytes32(keccak256("StorageItemCount"));
     }
 
     /**
      * @dev Check if the signed message has access to given data id
      * @param dataHash The id of the data item, which represents the sha256 hash of content
-     * @param signer The signer address
      */
-    function canKeyAccessData(bytes32 dataHash, address signer) public view returns(bool) {
-        bool bCanAccess = false;
+    function canKeyAccessData(bytes32 dataHash, bytes32 signedMessage, uint8 v, bytes32 r, bytes32 s) public view returns(bool) {
 
-        bytes32[] memory acl = addressToItemMap[signer];
+        //recover signers public key
+       address signer = recoverAddress(signedMessage,v,r,s);
+       address[] memory trusted = foreverStorage.getAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"));
 
-        //check ACL if public key has access
-        for(uint i = 0; i < acl.length;i++ )
-        {
-            if(acl[i] == dataHash)
-            {
-                bCanAccess = true;
-            }
-        }
-        return (bCanAccess);
+       bool bHasAccess = false;
+       for(uint i = 0;i < trusted.length;i++) {
+           if(trusted[i] == signer) {
+               bHasAccess = true;
+               break;
+           }
+       }
+
+       return bHasAccess;
+    }
+
+    /**
+     * @dev Check if the signed message has access to given data id
+     * @param dataHash The id of the data item, which represents the sha256 hash of content
+     */
+    function canKeyUpdateData(bytes32 dataHash, bytes32 signedMessage, uint8 v, bytes32 r, bytes32 s) public view returns(bool) {
+        //recover signers public key
+       address signer = recoverAddress(signedMessage,v,r,s);
+       return foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemOwner")) == signer;
     }
 
     /**
@@ -377,7 +427,7 @@ contract StorageNodeContract is Pausable {
      * @param dataHash The id of the data item, which represents the sha256 hash of content
      */
     function getAccessKeysForData(bytes32 dataHash) public view returns (address[]) {
-        return itemToAddressMap[dataHash];
+        return foreverStorage.getAddressesByBytes32(keccak256(dataHash, "StorageItemTrusted"));
     }
 
     /**
@@ -385,7 +435,7 @@ contract StorageNodeContract is Pausable {
      * @param key the key name for the data id
      */
     function getIdsForKey(bytes32 key) public view returns (bytes32[]) {
-        return keyToItemMap[key][msg.sender];
+        return foreverStorage.getBytes32ArrayByBytes32(keccak256(msg.sender, key, "StorageItemsForKey"));
     }
 
     /**
@@ -393,14 +443,23 @@ contract StorageNodeContract is Pausable {
     * @param key the key name for the data id
     */
     function getActualIdForKey(address wallet, bytes32 key) public view returns (bytes32) {
-        return keyToItemMap[key][wallet][keyToItemMap[key][wallet].length -1];
+        bytes32[] memory ids =  foreverStorage.getBytes32ArrayByBytes32(keccak256(wallet, key, "StorageItemsForKey"));
+        return ids[ids.length -1];
     }
 
     /**
      * @dev Get all data id's for given account
      */
     function getIdsForAccount(address wallet) public view returns (bytes32[]) {
-        return addressToItemMap[wallet];
+        return foreverStorage.getBytes32ByAddress(wallet);
+    }
+
+
+    /**
+     * @dev Get all responsible nodes for an item
+     */
+    function getNodesForItem(bytes32 dataHash) public view returns(address[]) {
+        return foreverStorage.getAddressesByBytes32(keccak256(dataHash, "StorageItemNodes"));
     }
 
 
@@ -408,7 +467,7 @@ contract StorageNodeContract is Pausable {
     * @dev Get all data id's for given account with given key
     */
     function getIdsForAccountByKey(address wallet, bytes32 key) public view returns(bytes32[]) {
-         return keyToItemMap[key][wallet];
+         return  foreverStorage.getBytes32ArrayByBytes32(keccak256(wallet, key, "StorageItemsForKey"));
     }
 
 
@@ -419,63 +478,26 @@ contract StorageNodeContract is Pausable {
     public
     constant
     returns (
+        address sender,
         address owner,
-        bytes32 id,
         bytes32 merkle ,
         uint256 size,
         bytes32  keyname,
         uint replicationMode ,
-        uint privacy,
-        uint duration,
-        uint createdAt,
-        bool exists) {
+        uint createdAt) {
 
-        uint index = hashToIdMap[dataHash];
-        StorageItem memory item = items[index];
-        return (
-        item.owner,
-        item.id,
-        item.merkle,
-        item.size,
-        item.keyname,
-        item.replicationMode,
-        item.privacy,
-        item.duration,
-        item.createdAt,
-        item.exists
+        return(
+        foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemCreator")),
+        foreverStorage.getAddressByBytes32(keccak256(dataHash, "StorageItemOwner")),
+        foreverStorage.getBytes32ByBytes32(keccak256(dataHash, "StorageItemMerkleRoot")),
+        foreverStorage.getUintByBytes32(keccak256(dataHash, "StorageItemSize")),
+        foreverStorage.getBytes32ByBytes32(keccak256(dataHash, "StorageItemKey")),
+        foreverStorage.getUintByBytes32(keccak256(dataHash, "StorageItemReplicationMode")),
+        foreverStorage.getUintByBytes32(keccak256(dataHash, "StorageItemCreated"))
         );
     }
 
-
-    /**
-    * @dev Recover address from signed message
-    */
-    function recoverAddress(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns(address) {
-        bytes memory prefix = "\x19Ethereum Signed Message:\n32";
-        bytes32 prefixedHash = keccak256(prefix, hash);
-        return ecrecover(prefixedHash, v, r, s);
+     function recoverAddress(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns(address) {
+        return ecrecover(hash, v, r, s);
     }
-
-
-    /**
-     * @dev Check if signed message is from given public key
-     */
-    function verify(bytes32 hash, uint8 v, bytes32 r, bytes32 s, address key) internal pure returns(bool) {
-        bytes memory prefix = "\x19Ethereum Signed Message:\n32";
-        bytes32 prefixedHash = keccak256(prefix, hash);
-        return ecrecover(prefixedHash, v, r, s) == key;
-    }
-
-    /**
-     * @dev return substring of given string with start and end index
-     */
-    function substring(string str, uint startIndex, uint endIndex) internal pure returns (string) {
-        bytes memory strBytes = bytes(str);
-        bytes memory result = new bytes(endIndex-startIndex);
-        for(uint i = startIndex; i < endIndex; i++) {
-            result[i-startIndex] = strBytes[i];
-        }
-        return string(result);
-    }
-
 }

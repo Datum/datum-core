@@ -43,4 +43,25 @@ library SafeMath {
   function min256(uint256 a, uint256 b) internal pure returns (uint256) {
     return a < b ? a : b;
   }
+
+   function nthRoot(uint _a, uint _n, uint _dp, uint _maxRuns) internal pure returns(uint) {
+        uint one = 10 ** (1 + _dp);
+        uint a0 = one ** _n * _a;
+
+        uint xNew = one;
+
+        uint iter = 0;
+        while (xNew != x && iter < _maxRuns) {
+            uint x = xNew;
+            uint t0 = x ** (_n - 1);
+            if (x * t0 > a0) {
+                xNew = x - (x - a0 / t0) / _n;
+            } else {
+                xNew = x + (a0 / t0 - x) / _n;
+            }
+            ++iter;
+        }
+
+        return (xNew + 5) / 10;
+    }
 }

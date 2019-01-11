@@ -1,8 +1,9 @@
-pragma solidity ^0.4.18;
+pragma solidity ^0.4.23;
 
 import './lib/SafeMath.sol';
 import './shared/Ownable.sol';
 import './VaultManager.sol';
+import './identity/DatumRegistry.sol';
 import './StorageContract.sol';
 
 
@@ -16,6 +17,10 @@ contract MarketplaceContract is Ownable {
 
     VaultManager public vault; //address of vault manager
     StorageNodeContract public storageContract; //address of storage contract
+    DatumRegistry public registry;
+
+
+    mapping(bytes32 => SignedProofRequest) public signingProofRequests;
 
     //hold data items that are for sale for a given address
     mapping(address => bytes32[]) public dataItemsForAddress;
@@ -65,6 +70,12 @@ contract MarketplaceContract is Ownable {
     //event fired if withdrawal
     event Withdrawal(address id, uint256 amount);
 
+    //event fired if a reward is received
+    event RewardReceived(bytes32 indexed id, address indexed owner, address indexed receiver, uint256 amount);
+
+    //event fired if signingproofRequest is created
+    event SigningProofRequestCreated(bytes32 indexed id, address indexed creator);
+
     struct DataItem {
         address owner;
         bytes32 dataHash;
@@ -81,6 +92,16 @@ contract MarketplaceContract is Ownable {
         address owner;
         uint256 amount;
         uint timestamp;
+    }
+
+    struct SignedProofRequest {
+        address creator;
+        uint256 reward;
+        bytes32[] claimsNeededSetByCreator;
+        bytes32 rewardModifierClaim;
+        uint256[] extraRewardsAmount;
+        bool exists;
+        mapping(address => bool) claimed;
     }
 
     struct Request {
@@ -105,9 +126,9 @@ contract MarketplaceContract is Ownable {
     }
 
    //constructor
-   constructor() public {
-        vault = new VaultManager();
-   }
+    constructor() public {
+            vault = new VaultManager();
+    }
 
 
     /**
@@ -118,12 +139,21 @@ contract MarketplaceContract is Ownable {
         vault = VaultManager(_vaultManagerAddress);
     }
 
-        /**
+    /**
      * @dev Set the active storage 
      */
     function setStorage(address _storageAddress) onlyOwner public 
     {
         storageContract = StorageNodeContract(_storageAddress);
+    }
+
+
+    /**
+     * @dev Set the active registry contract 
+    */
+    function setRegistry(address _registryAddress) onlyOwner public 
+    {
+        registry = DatumRegistry(_registryAddress);
     }
 
 
@@ -136,7 +166,7 @@ contract MarketplaceContract is Ownable {
      */
     function addAuction(bytes32 id, uint256 duration, uint256 minBid, uint256 bidStep, uint256 instatBuyPrice) public returns(bytes32) {
         //create id
-        bytes32 auctionId = keccak256(msg.sender, blockhash(block.number));
+        bytes32 auctionId = keccak256(abi.encodePacked(msg.sender, blockhash(block.number)));
 
 
         //push to auctions
@@ -161,7 +191,7 @@ contract MarketplaceContract is Ownable {
         require(msg.value > 0);
 
         //create id
-        bytes32 id = keccak256(msg.sender, blockhash(block.number), category,price,duration);
+        bytes32 id = keccak256(abi.encodePacked(msg.sender, blockhash(block.number), category,price,duration));
 
         //add  to virtual balance
         vault.addStorageBalance(msg.sender,id, msg.value);
@@ -174,6 +204,124 @@ contract MarketplaceContract is Ownable {
 
         //return id
        return id;
+    }
+
+
+    /**
+     * @dev Adds a sign proof request to the smart contract. Goal is that anyone can call this method an proof that
+     *      he have a valid signature created by creator of this request. If yes, he ged rewarded
+     * @param id id of the signProof request
+     * @param reward the base reward in wei
+     * @param claimsNeeded array of claims key names that needs to be exists and sigend by creator of proof request
+     * @param rewardModifierClaim claim key name where the level is stored, if exists the amount in extraRewardAmounts will be added
+     * @param extraRewardAmounts array of extra amount in wei that will be added depending on level got from modifier claim, e.g. [0, 0, 5, 15, 45, 95]
+     */
+    function addSigningProofRequest(bytes32 id, uint256 reward, bytes32[] claimsNeeded, bytes32 rewardModifierClaim, uint256[] extraRewardAmounts) public payable {
+        //if extraReward provided, it needs to have length 6
+        require(extraRewardAmounts.length == 0 || extraRewardAmounts.length == 6, "extra rewards array must have length 0 or 6");
+
+        //create struct
+        SignedProofRequest memory proofRequest = SignedProofRequest(msg.sender, reward, claimsNeeded, rewardModifierClaim, extraRewardAmounts, true);
+        //add request id to mapping for given msg.sender
+        signingProofRequests[id] = proofRequest;
+
+        //if deposit was provided within same transaction add to vault
+        if(msg.value != 0) {
+            vault.addBalance(msg.sender, msg.value);
+            emit Deposit(msg.sender, msg.value);
+        }
+
+        //fire events
+        emit SigningProofRequestCreated(id, msg.sender);
+    }
+
+
+    /**
+     * @dev Provide a signature for given id with providing the address that should be rewarded. The signature must be done by  
+     *      must be done by request creator, otherwise rejected
+     * @param id id of the signProof request
+     */
+    function proofSigningRequest(bytes32 id, address receiver, uint8 v, bytes32 r, bytes32 s ) public returns (bool)
+    {
+        SignedProofRequest storage request = signingProofRequests[id];
+
+        //request must exists
+        require(request.exists == true, "signingproof request with given id not exists");
+
+
+        //check if receiver has already claimed his reward
+        require(!request.claimed[receiver], "receiver already claimed the reward");
+
+        //create hash of receiver address, that was signed outside
+        bytes32 hash = keccak256(abi.encodePacked(receiver));
+
+        //receive signer address from signature that also signed the receiver
+        address signer = recoverAddress(hash, v,r,s);
+
+        //signature must be done from original request sender
+        require(request.creator == signer, "creator must match signing address");
+
+        //check if all claims needed exists and has value other than default
+        for(uint i = 0; i < request.claimsNeededSetByCreator.length;i++) {
+            bytes32 value = registry.getClaim(signer, receiver, request.claimsNeededSetByCreator[i]);
+            require(value != 0, "claim don't exists");
+        }
+       
+
+        //check if the is a reward modifier claim
+        uint rewardAmount = request.reward;   
+        if(request.rewardModifierClaim != 0) {
+            bytes32 addLevel = registry.getClaim(signer, receiver, request.rewardModifierClaim);
+            if(addLevel != 0) {
+                uint levelInt = bytesToUInt(addLevel);
+                if(request.extraRewardsAmount.length > 0) {
+                    rewardAmount = rewardAmount.add(request.extraRewardsAmount[levelInt]);
+                }
+            }
+        }
+
+        //check if balance is sufficient for payout
+        require(vault.getBalance(request.creator) >= rewardAmount);
+
+        //make the payout to receiver address and reduce from creator
+        vault.subtractBalance(request.creator,rewardAmount);
+
+        //send DAT        
+        receiver.send(rewardAmount);
+
+        //set claimed flag to true
+        request.claimed[receiver] = true;
+
+        //fire reward event
+        emit RewardReceived(id, request.creator, receiver, rewardAmount);
+
+        return true;
+        
+    }
+
+    /**
+     * @dev Provide a signature for given id with providing the address that should be rewarded. The signature must be done by  
+     *      must be done by request creator, otherwise rejected
+     * @param id id of the signProof request
+     */
+    function proofSigningRequests(bytes32 id, address[] receiver, uint8[] v, bytes32[] r, bytes32[] s ) public returns (bool[])
+    {
+        //request must exists
+        require(signingProofRequests[id].exists != true, "signingproof request with given id not exists");
+
+        //all array length must have same length
+        require(receiver.length == v.length, "arrays must have same length");
+
+
+        bool[] storage successFlags;
+
+        //iterate trough all entries in array
+        for(uint i = 0; i < receiver.length;i++) {
+            bool bReturn = proofSigningRequest(id, receiver[i], v[i], r[i], s[i]);
+            successFlags.push(bReturn);
+        }
+
+        return successFlags;
     }
 
     /**
@@ -224,7 +372,7 @@ contract MarketplaceContract is Ownable {
 
 
    function buyDataItem(bytes32 id) public payable {
-       
+
        if(msg.value != 0) {
             vault.addBalance(msg.sender, msg.value);
 
@@ -378,6 +526,14 @@ contract MarketplaceContract is Ownable {
         return hashes;
     }
 
+
+    /**
+    * @dev Get all item owned or bought by given address
+    */
+    function getItemIdsForAddress(address wallet) public view returns (bytes32[]) {
+        return dataItemsForAddress[wallet];
+    }
+
     /**
      * @dev Get specified storage item by given id
      */
@@ -409,5 +565,34 @@ contract MarketplaceContract is Ownable {
         item.proof,
         item.exists
         );
+    }
+
+
+    /**
+    * @dev Recover address from signed message
+    */
+    function recoverAddress(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns(address) {
+        return ecrecover(hash, v, r, s);
+    }
+
+    /// @dev Converts a numeric string to it's unsigned integer representation.
+    /// @param v The string to be converted.
+    function bytesToUInt(bytes32 v) internal pure returns (uint ret) {
+        if (v == 0x0) {
+            revert();
+        }
+        uint digit;
+        for (uint i = 0; i < 32; i++) {
+            digit = uint((uint(v) / (2 ** (8 * (31 - i)))) & 0xff);
+            if (digit == 0) {
+                break;
+            }
+            else if (digit < 48 || digit > 57) {
+                revert();
+            }
+            ret *= 10;
+            ret += (digit - 48);
+        }
+        return ret;
     }
 }

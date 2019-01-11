@@ -26,9 +26,14 @@ contract ForeverStorage is Administratable {
     mapping(address => bool)       private addressboolStorage;
     mapping(address => int256)     private addressintStorage;
 
+
+    //array mappings
     mapping(address => bytes32[])    private addressbytes32ArrayStorage;
     mapping(bytes32 => address[])    private bytes32addressArrayStorage;
     mapping(bytes32 => bytes32[])    private bytes32bytes32ArrayStorage;
+
+
+    /* GET */
 
     /// @param _key The key for the record
     function getAddressByBytes32(bytes32 _key) public view returns (address) {
@@ -73,22 +78,11 @@ contract ForeverStorage is Administratable {
 
 
 
+    /* SET */
 
     /// @param _key The key for the record
     function setAddressByBytes32(bytes32 _key, address _value) onlyAdmins external {
         bytes32addressStorage[_key] = _value;
-    }
-
-    /// @param _key The key for the record
-    /// @param _value The value for the record
-    function setAddressesByBytes32(bytes32 _key, address _value) onlyAdmins external {
-        bytes32addressArrayStorage[_key].push(_value);
-    }
-
-    /// @param _key The key for the record
-    /// @param _value The value for the record
-    function setBytes32ArrayByBytes32(bytes32 _key, bytes32 _value) onlyAdmins external {
-        bytes32bytes32ArrayStorage[_key].push(_value);
     }
 
     /// @param _key The key for the record
@@ -121,6 +115,22 @@ contract ForeverStorage is Administratable {
         bytes32intStorage[_key] = _value;
     }
 
+    /// @param _key The key for the record
+    /// @param _value The value for the record
+    function setAddressArrayByBytes32(bytes32 _key, address _value) onlyAdmins external {
+        bytes32addressArrayStorage[_key].push(_value);
+    }
+
+    /// @param _key The key for the record
+    /// @param _value The value for the record
+    function setBytes32ArrayByBytes32(bytes32 _key, bytes32 _value) onlyAdmins external {
+        bytes32bytes32ArrayStorage[_key].push(_value);
+    }
+
+
+
+    /* DELETE */
+
     
     /// @param _key The key for the record
     function deleteAddressByBytes32(bytes32 _key) onlyAdmins external {
@@ -128,14 +138,14 @@ contract ForeverStorage is Administratable {
     }
 
     /// @param _key The key for the record
-    function deleteAllAddressesByBytes32(bytes32 _key) onlyAdmins external {
+    function deleteAllAddressesFromArrayByBytes32(bytes32 _key) onlyAdmins external {
         delete bytes32addressArrayStorage[_key];
     }
 
-
+    
     /// @param _key The key for the record
     /// @param _value The value for the record
-    function deleteAddressesByBytes32(bytes32 _key, address _value) onlyAdmins external {
+    function deleteAddressFromArrayByBytes32(bytes32 _key, address _value) onlyAdmins external {
         address[] storage prfs = bytes32addressArrayStorage[_key];
 
         uint i = 0;
@@ -143,28 +153,43 @@ contract ForeverStorage is Administratable {
             i++;
         }
 
+
+        prfs[i] = prfs[prfs.length-1];
+        prfs.length--;
+
+/*
         while (i<prfs.length-1) {
             prfs[i] = prfs[i+1];
             i++;
         }
         prfs.length--;
+        */
     }
+    
 
     /// @param _key The key for the record
     /// @param _value The value for the record
-    function deleteBytes32ArrayByBytes32(bytes32 _key, bytes32 _value) onlyAdmins external {
+    function deleteBytes32FromArrayByBytes32(bytes32 _key, bytes32 _value) onlyAdmins external {
        bytes32[] storage prfs = bytes32bytes32ArrayStorage[_key];
 
         uint i = 0;
+
+        //get index
         while (prfs[i] != _value) {
             i++;
         }
 
+
+        prfs[i] = prfs[prfs.length-1];
+        prfs.length--;
+
+/*
         while (i<prfs.length-1) {
             prfs[i] = prfs[i+1];
             i++;
         }
         prfs.length--;
+        */
     }
 
     /// @param _key The key for the record
@@ -195,8 +220,9 @@ contract ForeverStorage is Administratable {
 
 
 
+    /* METHOD FOR ADDRESS AS KEY */
 
-    /* ADDRESSES */
+    /* GET BY ADDRESS */
 
     
     /// @param _key The key for the record
@@ -231,8 +257,6 @@ contract ForeverStorage is Administratable {
 
 
    /* SET BY ADDRESS */
-
-  
 
     /// @param _key The key for the record
     function setAddressByAddress(address _key, address _value) onlyAdmins external {
@@ -271,16 +295,16 @@ contract ForeverStorage is Administratable {
 
     /* DELETE */
 
-        /// @param _key The key for the record
-    function deleteAddressByBytes32(address _key) onlyAdmins external {
+    /// @param _key The key for the record
+    function deleteAddressByAddress(address _key) onlyAdmins external {
         delete addressaddressStorage[_key];
     }
 
-    function deleteAllAddressesByBytes32(address _key) onlyAdmins external {
+    function deleteAllBytes32ByAddress(address _key) onlyAdmins external {
       delete addressbytes32ArrayStorage[_key];
     }
 
-    function deleteAddressesByBytes32(address _key, bytes32 _value) onlyAdmins external {
+    function deleteBytes32FromArrayByAddress(address _key, bytes32 _value) onlyAdmins external {
         bytes32[] storage prfs = addressbytes32ArrayStorage[_key];
 
         uint i = 0;
@@ -288,11 +312,17 @@ contract ForeverStorage is Administratable {
             i++;
         }
 
+
+        prfs[i] = prfs[prfs.length-1];
+        prfs.length--;
+
+        /*
         while (i<prfs.length-1) {
             prfs[i] = prfs[i+1];
             i++;
         }
         prfs.length--;
+        */
     }
 
     /// @param _key The key for the record

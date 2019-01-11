@@ -1,4 +1,4 @@
-pragma solidity 0.4.23;
+pragma solidity ^0.4.23;
 
 import "./MetaIdentityManager.sol";
 
@@ -43,20 +43,12 @@ contract TxRelay {
         // only allow senders from the whitelist specified by the user,
         require(whitelist[listOwner][msg.sender]);
 
-        //address originalSender = getAddress(data);
-
-
+        //address originalSender = getAddress(data)
         address originalSender = msg.sender;
-
-
-        emit Test(originalSender);
         // use EIP 191
         // 0x19 :: version :: relay :: whitelistOwner :: nonce :: destination :: data
         bytes32 h = keccak256(byte(0x19), byte(0), this, listOwner, nonce[originalSender], destination, data);
         address addressFromSig = ecrecover(h, sigV, sigR, sigS);
-
-
-        emit Test(addressFromSig);
       
         //original sender must be the signer of datda
         require(originalSender == addressFromSig);

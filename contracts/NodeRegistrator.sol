@@ -1,25 +1,25 @@
-pragma solidity ^0.4.23;
+pragma solidity ^0.4.24;
 
 import './lib/SafeMath.sol';
-import './shared/Operator.sol';
+import './shared/Administratable.sol';
 import './VaultManager.sol';
-import './lib/Strings.sol';
-import './ForeverStorage.sol';
 import "./snarks/Verifier.sol";
+import "./StorageKeys.sol";
+import "./NodeRegistratorData.sol";
 
 
 /**
  * @title NodeRegistrator
  * Contract to hold all storage nodes in datum network
   */
-contract NodeRegistrator is Operator {
+contract NodeRegistrator is Administratable {
      //safe math for all uint256 types
     using SafeMath for uint256;
-    using Strings for *;
 
     //default vault manager used for locking money in contract
     VaultManager public vault; //address of vault manager
-    ForeverStorage public foreverStorage; //storage contract
+    StorageKeys public storageKeys;
+    NodeRegistratorData public nodeData;
 
     //set default min deposit amount
     uint public nodeRegisterDepositAmount = 1 ether;
@@ -50,44 +50,51 @@ contract NodeRegistrator is Operator {
      //event fired if deposit
     event Deposit(address owner, uint256 amount);
 
+    //event fired if deposit
+    event AdminWithdrawal(address owner, uint256 amount);
+
+    //event fired when VerifyZKProof is called
+    event ZKProofVerified(bool verified);
+
     event StorageProofSuccessFull(address indexed storageNode, bytes32 indexed dataHash);
 
-    event StorageProofSuccessFailed(address indexed storageNode, bytes32 indexed dataHash);
+    event StorageProofFailed(address indexed storageNode, bytes32 indexed dataHash, uint timestamp);
 
-    constructor() public {
+    //event if a storage node claim his rewards
+    event StorageNodeRewarded(bytes32 dataHash, address storageNode, uint256 value);
+
+    constructor(address _vault, address _storageKeys, address _nodeData) public {
         //by default a new vault manager is created, can be overwritten with setVaultManager
-        vault = new VaultManager();
-        //foreverStorage = new ForeverStorage();
+        vault = VaultManager(_vault);
+        storageKeys = StorageKeys(_storageKeys);
+        nodeData = NodeRegistratorData(_nodeData);
     }
-
 
     /**
      * @dev Allows the current operator to set a new Vault Manager.
      * @param _vaultManagerAddress The address of the deployed vault manager
      */
-    function setVaultManager(address _vaultManagerAddress) onlyOperator public 
+    function setVaultManager(address _vaultManagerAddress) onlyAdmins public 
     {
         vault = VaultManager(_vaultManagerAddress);
     }
-
 
      /**
      * @dev Allows to open or close node registration
      * @param _state true / false
      */
-    function setRegistrationState(bool _state) onlyOperator public 
+    function setRegistrationState(bool _state) onlyAdmins public 
     {
         registrationOpen = _state;
     }
-
     
     /**
-     * @dev Allows the current operator to set a new storage.
-     * @param _foreverStorageAddress The address of the deployed vault manager
+     * @dev Allows the current operator to set a new node data.
+     * @param _nodeData The address of the deployed node data manager
      */
-    function setStorage(address _foreverStorageAddress) onlyOperator public 
+    function setNodeData(address _nodeData) onlyAdmins public 
     {
-        foreverStorage = ForeverStorage(_foreverStorageAddress);
+        nodeData = NodeRegistratorData(_nodeData);
     }
 
     //get acutal staking balance
@@ -95,18 +102,23 @@ contract NodeRegistrator is Operator {
         return vault.getBalance(msg.sender);
     }
 
-
-    //returns the max amount of allowed storage for given msg.sender in MB
+    //returns the max amount of allowed storage for given msg.sender in bytes
     function getMaxStorageAmount(address nodeAddress
-    ) public view returns(uint256) {
-        return vault.getBalance(nodeAddress).div(500).div(1000000000000000);
+    ) public view returns(uint) {
+        if(nodeData.isAddressDatumNode(nodeAddress)) {
+            //return max uint value;
+            uint256 max = 2**256 - 1;
+            return max;
+        }
+        return nodeData.getMaxStorageAmount(vault.getBalance(nodeAddress));
+        
     }
 
      /**
      * @dev Allows the current operator to set a new registerNodeDepositAmount.
      * @param amount Amount that a new node must deposit to register himself
      */
-    function setRegisterNodeDepositAmount(uint amount) onlyOperator public {
+    function setRegisterNodeDepositAmount(uint amount) onlyAdmins public {
         nodeRegisterDepositAmount = amount;
     }
 
@@ -114,8 +126,12 @@ contract NodeRegistrator is Operator {
      * @dev Allows the current operator to set a new max amount of storage nodes
      * @param amount Amount of max storage nodes
      */
-    function setMaxStorageNodes(uint amount) onlyOperator public {
+    function setMaxStorageNodes(uint amount) onlyAdmins public {
         maxStorageNodes = amount;
+    }
+
+    function getNodeCount() public view returns(uint) {
+        return nodeData.getNodeCount();
     }
 
 
@@ -133,6 +149,18 @@ contract NodeRegistrator is Operator {
         emit Deposit(msg.sender, msg.value);
     }
 
+
+    /**
+    * @dev adminWithdrawal Only used for migration
+    */
+    function adminWithdrawal(uint256 amount) public onlyOwner {
+         //Send tokens
+        msg.sender.transfer(amount);
+
+        //fire event
+        emit AdminWithdrawal(msg.sender, amount);
+    }
+
      /**
      * @dev Register a new storage node in datum network
      * @param endpoint Endpoint address of storage node
@@ -140,28 +168,19 @@ contract NodeRegistrator is Operator {
      * @param region Region where node is based
      */
     function registerNode(string endpoint, uint256 bandwidth, uint256 region) payable public {
-
         //check if node already exists, if yes update data only
-        if(foreverStorage.getBoolByBytes32(keccak256(msg.sender, "NodeExists"))) {
-            foreverStorage.setStringByBytes32(keccak256(msg.sender, "NodeEndPoint"), endpoint);
-            foreverStorage.setUintByBytes32(keccak256(msg.sender, "NodeRegion"), region);
-            foreverStorage.setUintByBytes32(keccak256(msg.sender, "NodeBandwidth"), bandwidth);
-
+        if(nodeData.nodeExists(msg.sender)) {
+            //update node data
+            nodeData.update(msg.sender, endpoint, bandwidth, region);
+            //fire event
             emit NodeUpdated(msg.sender, endpoint, bandwidth, region);
-
             return;
         }
 
         require(registrationOpen == true, "Registration is closed at moment");
         
-        //key for node list
-        bytes32 keyNodeList = keccak256("NodeList");
-
-        //get actual node list
-        address[] memory nodeList = foreverStorage.getAddressesByBytes32(keyNodeList);
-
         //check max amount of storage nodes is reached
-        require(nodeList.length < maxStorageNodes, "max amount of storage nodes is reached");
+        require(nodeData.getNodeCount() < maxStorageNodes, "max amount of storage nodes is reached");
 
         //add to locked amount for address if value is bigger than 0
         if(msg.value > 0) 
@@ -178,54 +197,40 @@ contract NodeRegistrator is Operator {
 
         //min amount must be sent or lockedAmounts must have at least 
         require(msg.value >= nodeRegisterDepositAmount || vault.getBalance(msg.sender) >= nodeRegisterDepositAmount, "you have to provide a staking within this transaction or with deposit");
-
-        //check if master node based on endpoint address
-        bool isMasterNode = false;
-        Strings.slice memory s = endpoint.toSlice();
-        if(s.endsWith(".datum.org".toSlice())) {
-            isMasterNode = true;
-        } 
-       
-        
+     
         //set to storage
-        foreverStorage.setStringByBytes32(keccak256(msg.sender, "NodeEndPoint"), endpoint);
-        foreverStorage.setUintByBytes32(keccak256(msg.sender, "NodeRegion"), region);
-        foreverStorage.setUintByBytes32(keccak256(msg.sender, "NodeBandwidth"), bandwidth);
-        foreverStorage.setStringByBytes32(keccak256(msg.sender, "NodeStatus"), "active");
-        foreverStorage.setBoolByBytes32(keccak256(msg.sender, "NodeIsMasterNode"), isMasterNode);
-        foreverStorage.setBoolByBytes32(keccak256(msg.sender, "NodeExists"), true);
-        foreverStorage.setAddressesByBytes32(keyNodeList, msg.sender);
+        nodeData.set(msg.sender, endpoint, region, bandwidth);
         
         //throw event for new nodes registered
         emit NodeRegistered(msg.sender, endpoint, bandwidth, region);
+    }
+
+
+
+    /**
+    * @dev Set the node to offline or online modus
+    */
+    function setNodeMode(bool bOnline) public {
+        nodeData.setNodeMode(msg.sender, bOnline);
     }
   
      /**
      * @dev Start and unregistrationg Process for the storage node
      */
     function unregisterNodeStart() public {
-        bool bExists = nodeExists(msg.sender);
+        bool bExists = nodeData.nodeExists(msg.sender);
 
         //check if msg.sender is a registered node and exists in mapping
         require(bExists, "your node is not a registered node in network");      
 
         //set to unregister list
-        bytes32 keyNodeUnregisterStart = keccak256(msg.sender, "NodeUnregisterStart");
-        foreverStorage.setUintByBytes32(keyNodeUnregisterStart, now);
-        foreverStorage.setStringByBytes32(keccak256(msg.sender, "NodeStatus"), "unregister");
+        nodeData.startUnregister(msg.sender);
 
         //fire event
         emit NodeStartUnRegister(msg.sender, now);
         
     }
 
-    function nodeExists(address node) public view returns(bool) {
-        return foreverStorage.getBoolByBytes32(keccak256(node, "NodeExists"));
-    }
-
-    function getNodeCount() public view returns(uint256) {
-        return foreverStorage.getAddressesByBytes32(keccak256("NodeList")).length;
-    }
 
     /**
      * @dev Unregister a node after challenge period ended
@@ -233,23 +238,13 @@ contract NodeRegistrator is Operator {
     function unregisterNode() public {
 
         //check if msg.sender is a registered node and exists in mapping
-        require(nodeExists(msg.sender), "your node is not a registered node in network");
-
-        bytes32 keyNodeUnregisterStart = keccak256(msg.sender, "NodeUnregisterStart");
+        require(nodeData.nodeExists(msg.sender), "your node is not a registered node in network");
 
         //only allow if challenge time eas exceeded
-        require(block.timestamp > (foreverStorage.getUintByBytes32(keyNodeUnregisterStart) + 1 days), "the challenge time is not over, please wait");
+        require(block.timestamp > (nodeData.getStartUnregisterDate(msg.sender) + 1 days), "the challenge time is not over, please wait");
 
-        //delete from mapping
-        foreverStorage.deleteBoolByBytes32(keccak256(msg.sender, "NodeExists"));
-        foreverStorage.deleteAddressesByBytes32(keccak256("NodeList"), msg.sender);
-
-        //delete infos
-        foreverStorage.deleteStringByBytes32(keccak256(msg.sender, "NodeEndPoint"));
-        foreverStorage.deleteUintByBytes32(keccak256(msg.sender, "NodeRegion"));
-        foreverStorage.deleteUintByBytes32(keccak256(msg.sender, "NodeBandwidth"));
-        foreverStorage.deleteStringByBytes32(keccak256(msg.sender, "NodeStatus"));
-        foreverStorage.setBoolByBytes32(keccak256(msg.sender, "NodeExists"), false);
+        //remove node
+        nodeData.remove(msg.sender);
 
         //send tokens
         msg.sender.transfer(vault.getBalance(msg.sender));
@@ -259,32 +254,101 @@ contract NodeRegistrator is Operator {
     }
 
     /**
-     * @dev Get storage node endpoint address only
-     * @param _address Address of the node
-     */
-    function getNodeEndpoint(address _address) public constant returns(string) 
-    {
-        return foreverStorage.getStringByBytes32(keccak256(_address, "NodeEndPoint"));
+    * @dev Allow Operator to remove a node
+    */
+    function removeNodeFromAdmin(address _nodeAddress) public onlyAdmins {
+        
+        nodeData.remove(_nodeAddress);
+        //fire vent
+        emit NodeUnRegistered(_nodeAddress);
     }
 
      /**
-     * @dev Get storage node status 
-     * @param _address Address of the node
-     */
-    function getNodeStatus(address _address) public constant returns(string) 
-    {
-        return foreverStorage.getStringByBytes32(keccak256(_address, "NodeStatus"));
-    }
-
-    /**
      * @dev Generate random index number from existsing nodes
      * @param seed seed for randomness
      */
     function getRandomNode(uint seed) public constant returns (address) {
+        address[] memory nodeAddresses = nodeData.getNodes();
+        if(nodeAddresses.length == 0) return address(0);
+        return nodeAddresses[uint(keccak256(abi.encodePacked(blockhash(block.number-1), seed )))%nodeAddresses.length];
+    }
 
-        bytes32 keyNodeList = keccak256("NodeList");
-        address[] memory nodeAddresses = foreverStorage.getAddressesByBytes32(keyNodeList);
-        return nodeAddresses[uint(keccak256(blockhash(block.number-1), seed ))%nodeAddresses.length];
+    /**
+     * @dev Generate random index number from existsing datum nodes
+     * @param seed seed for randomness
+     */
+    function getRandomDatumNode(uint seed) public constant returns (address) {
+        address[] memory nodeAddresses = nodeData.getDatumNodes();
+        if(nodeAddresses.length == 0) return address(0);
+        return nodeAddresses[uint(sha3(blockhash(block.number-1), seed ))%nodeAddresses.length];
+    }
+
+    function nodeExistsInArray(address[] memory nodeList, address node) internal pure returns(bool) {
+        for(uint i = 0; i < nodeList.length;i++) {
+            if(nodeList[i] == node) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function getSizeStoredByNode(address nodeAddress) public view returns(uint) {
+        return nodeData.getSizeStoredByNode(nodeAddress);
+    }
+
+    /**
+     * @dev Generate random index number from existsing nodes
+     * @param count amount of  nodes
+     */
+    function getRandomNodes(uint256 minSize, uint count) public constant returns (address[]) {
+        //check that node count don't exceeds total registrations
+        require(nodeData.getNodeCount() >= count, "You requested more nodes than registrered");
+
+        address[] memory a = new address[](count);
+        uint defaultNodeCount = nodeData.getNodes().length;
+        uint exitCount = 15;
+        uint counter = 0;
+        uint defaultNodesRequested = (count - 1) > defaultNodeCount ? defaultNodeCount : count -1;
+
+        //get amount of nodes minus one, because last node will be always a datum node, but keep length of default nodes in mind
+        for(uint i = 0; i < count;i++) {
+
+            address nodeAddress = address(0);
+
+            bool hasNodeEnoughSpace = true;
+
+            if(i < defaultNodesRequested) {
+                //get random non datum node
+                nodeAddress = getRandomNode(now + i);
+            } else {
+                nodeAddress = getRandomDatumNode(now + i);
+            }
+
+            //check if selected node has enough space
+            hasNodeEnoughSpace = (getMaxStorageAmount(nodeAddress) - nodeData.getSizeStoredByNode(nodeAddress)) > minSize;
+            
+            //add to list, if already exists try to get another
+            while(nodeExistsInArray(a, nodeAddress) || !hasNodeEnoughSpace) {
+                if(i < defaultNodesRequested) {
+                    nodeAddress = getRandomNode(now + i + counter);
+                } else {
+                    nodeAddress = getRandomDatumNode(now + i + counter);
+                }
+                counter++;
+                if(counter >= exitCount) {
+                    nodeAddress = address(1);
+                    break;
+                }
+
+                //check if selected node has enough space
+                hasNodeEnoughSpace = (getMaxStorageAmount(nodeAddress) - nodeData.getSizeStoredByNode(nodeAddress)) > minSize;
+            } 
+
+            //set address
+            a[i] = nodeAddress;
+        }
+
+        return a;
         
     } 
 
@@ -299,24 +363,16 @@ contract NodeRegistrator is Operator {
         string endpoint,
         uint bandwidth,
         uint region,
-        string status) {
+        string status,
+        bool online,
+        bool datumNode) {
 
-        bytes32 keyStatus = keccak256(node, "NodeStatus");
-        bytes32 keyEndpoint = keccak256(node, "NodeEndPoint");
-        bytes32 keyRegion = keccak256(node, "NodeRegion");
-        bytes32 keyBandwith = keccak256(node, "NodeBandwidth");
-
-        return (
-        foreverStorage.getStringByBytes32(keyEndpoint),
-        foreverStorage.getUintByBytes32(keyBandwith),
-        foreverStorage.getUintByBytes32(keyRegion),
-        foreverStorage.getStringByBytes32(keyStatus));
-
+        return nodeData.getNodeInfo(node);
     } 
 
 
     //checks if 
-    function verifyProof(
+    function verifyMerkleProof(
     bytes32[] _proof,
     bytes32 _root,
     bytes32 _leaf
@@ -344,73 +400,145 @@ contract NodeRegistrator is Operator {
     }
 
     
-     //called from storage nodes to proof that the really stored this data
-    function giveForcedStorageProof(bytes32 dataHash, bytes32[] proof, bytes32 leafHash) public {
-        //check if proof request exists
-        require(foreverStorage.getUintByBytes32(keccak256(dataHash, msg.sender, "StorageProofRequestTimestamp")) > 0, "No forced proof exists the given storagenoNode (msg.sender)");
+    function VerifyZKProof (
+        uint256[] alpha, 
+        uint256[2][2] beta, 
+        uint256[2][2] gamma, 
+        uint256[2][2] delta, 
+        uint256[2][3] gammaABC,
+        uint256[] proofA,
+        uint256[2][2] proofB,
+        uint256[] proofC,
+        uint256[] input,
+        bytes32 dataHash) public 
+	{
+		Verifier.VerifyingKey memory vk;
 
-        //get merkle root of item
-        bytes32 merkle_root = foreverStorage.getBytes32ByBytes32(keccak256(dataHash, "StorageItemMerkleRoot"));
+        vk.beta = Pairing.G2Point(beta[0], beta[1]);
+        vk.gamma = Pairing.G2Point(gamma[0], gamma[1]);
+        vk.delta = Pairing.G2Point(delta[0], delta[1]);
+		vk.alpha = Pairing.G1Point(alpha[0], alpha[1]);
+		
+        vk.gammaABC = new Pairing.G1Point[](3);
+		vk.gammaABC[0] = Pairing.G1Point(gammaABC[0][0],gammaABC[0][1]);
+        vk.gammaABC[1] = Pairing.G1Point(gammaABC[1][0],gammaABC[1][1]);
+        vk.gammaABC[2] = Pairing.G1Point(gammaABC[2][0],gammaABC[2][1]);
 
-        //check if proof was valid and if yes, remove from mapping to prevent further penalty for node
-        bool bValid = verifyProof(proof, merkle_root, leafHash);
-        if(bValid) {
-            //delete from mapping
+        Verifier.Proof memory proof;
+    	proof.B = Pairing.G2Point(proofB[0], proofB[1]);
+		proof.A = Pairing.G1Point(proofA[0], proofA[1]);
+		proof.C = Pairing.G1Point(proofC[0], proofC[1]);
+	
+        bool verified = Verifier.Verify(vk, proof, input);
+        nodeData.setVerifiedProof(msg.sender, dataHash, verified);
+        emit ZKProofVerified(verified);
+	}
+    
+    
 
-            //Check if proof was given in set timespan
-            uint proofRequested = foreverStorage.getUintByBytes32(keccak256(dataHash, msg.sender, "StorageProofRequestTimestamp"));
-            if((now - proofRequested < 250) || 
-            (foreverStorage.getBoolByBytes32(keccak256(dataHash, msg.sender,  "StorageProofWorkStatus")) && now - proofRequested < 6000))
+    
+    //create transaction with all failed proofs as event
+    function getFailedStorageProofs() public {
+        bytes32[] memory hashes = nodeData.getProofs(msg.sender);
+
+        //get only last 20
+        uint maxCount = 20;
+        for(uint i = 0;i < hashes.length;i++) {
+            uint proofRequested = nodeData.getProofRequestTime(msg.sender, hashes[i]);
+            if((now - proofRequested > 250) || 
+            (nodeData.getProofWorkstatus(msg.sender, hashes[i]) && now - proofRequested > 300))
             {
-                if(foreverStorage.getBoolByBytes32(keccak256(dataHash, msg.sender,  "StorageProofSnarksVerified"))) {
-                    foreverStorage.deleteUintByBytes32(keccak256(dataHash, msg.sender, "StorageProofRequestTimestamp"));
-                    foreverStorage.deleteAllAddressesByBytes32(keccak256(dataHash, msg.sender, "StorageProofRequestCreator"));
-                    foreverStorage.deleteUintByBytes32(keccak256(dataHash, msg.sender, "StorageProofRequestChunk"));
-                    foreverStorage.deleteBytes32ArrayByBytes32(keccak256(msg.sender, "StorageProofsForAddress"), dataHash);
+                //failed proof
+                emit StorageProofFailed(msg.sender, hashes[i], proofRequested);
 
-                    //fire event
-                    emit StorageProofSuccessFull(msg.sender, dataHash);
+                //break
+                if(i >= maxCount)
+                {
+                    break;
                 }
             }
-        } else {
-            //fire event
-            emit StorageProofSuccessFailed(msg.sender, dataHash);
+            
         }
     }
     
 
 
-      function estimateRewards() public returns(uint256) {
+
+    
+     //called from storage nodes to proof that the really stored this data
+    function giveForcedStorageProof(bytes32 dataHash, bytes32[] proof, bytes32 leafHash) public {
+        //check if proof request exists
+        require(nodeData.getProofRequestTime(msg.sender, dataHash) > 0, "No forced proof exists the given storagenoNode (msg.sender)");
+        //get merkle root of item
+        bytes32 merkle_root = nodeData.getMerkleRoot(dataHash);
+        //get storage proof request time
+        uint proofRequested = nodeData.getProofRequestTime(msg.sender, dataHash);
+        //check if proof was valid and if yes, remove from mapping to prevent further penalty for node
+        bool merkleProofValid = verifyMerkleProof(proof, merkle_root, leafHash);
+        bool zkproofValid = nodeData.getVerifiedProof(msg.sender, dataHash);
+        if(now - proofRequested < 300 && merkleProofValid && zkproofValid) {
+            //delete proof if verified
+            nodeData.removeProof(msg.sender, dataHash);
+            //fire event
+            emit StorageProofSuccessFull(msg.sender, dataHash);
+        } else {
+            //fire event
+            emit StorageProofFailed(msg.sender, dataHash, now);
+        }
+    }
+
+
+    function estimateRewards() public returns(uint256) {
+        return collectRewards(false);
+    }
+
+    //called from storage node to collect rewards
+    function collectRewards(bool bCollect) public returns(uint256){
         //get all hashes stored by this node
-        bytes32[] memory hashes = foreverStorage.getBytes32ArrayByBytes32(keccak256(msg.sender, "ItemsForNode"));
+        bytes32[] memory hashes = nodeData.getItemsForNode(msg.sender);
 
         uint256 rewards = 0;
+
         //go trough all and calculate rewards / check for storage proofs
         for(uint i = 0; i < hashes.length;i++) {
-
-            //last paid
-            uint lastPaid = foreverStorage.getUintByBytes32(keccak256(msg.sender, hashes[i], "StorageItemLastPaid")); 
-            uint itemCreatedAt = foreverStorage.getUintByBytes32(keccak256(hashes[i], "StorageItemCreated"));
-            uint256 itemSize = foreverStorage.getUintByBytes32(keccak256(hashes[i], "StorageItemSize"));
-
             //calculate time to be payed for
-            uint timeToBePaidInSeconds = now.sub(itemCreatedAt).sub(lastPaid);
+            uint timeToBePaidInSeconds = now.sub(nodeData.getItemCreated(hashes[i])).sub(nodeData.getItemLastPaid(hashes[i], msg.sender));
 
             //storage costs for  1 day for 1 byte
-            uint256 costs = 500000000000000 wei;
-            uint256 costsBytePerDay = costs.div(1024).div(30);
-
-            uint256 costsItemPerDay = costsBytePerDay.mul(itemSize);
+            uint256 costs = 155220429 wei;
+            uint256 costsItemPerDay = costs.div(1024).div(30).mul(nodeData.getItemSize(hashes[i]));
 
             //calculate real costs/reward
             uint256 realCosts = costsItemPerDay.mul(timeToBePaidInSeconds).div(24).div(60).div(60);
-            
-            //get the address that makes the deposit for this item
-            address depositer = foreverStorage.getAddressByBytes32(keccak256(hashes[i], "StorageItemCreator"));
-
             rewards = rewards.add(realCosts);
+
+            if(bCollect) {
+                //get the address that makes the deposit for this item
+                address depositer = nodeData.getItemCreator(hashes[i]);
+
+                //check if enough balance is there
+                if(vault.getBalance(depositer) >= realCosts) {
+                    vault.subtractBalance(depositer, realCosts);
+                    vault.addBalance(msg.sender, realCosts);
+
+                    emit StorageNodeRewarded(hashes[i], msg.sender, realCosts);
+
+                } else {
+                    //get total amount exists on balance and delete item
+                    uint256 depositerAmount = vault.getBalance(depositer);
+                    vault.subtractBalance(depositer,depositerAmount);
+                    vault.addBalance(msg.sender, depositerAmount);
+                    //removeDataItem(hashes[i]);
+
+                    emit StorageNodeRewarded(hashes[i], msg.sender, depositerAmount);
+                }
+
+                //set last paid date for this item
+                nodeData.setItemLastPaid(hashes[i], msg.sender);
+            }
         }
 
         return rewards;
     }
+
 }

@@ -1,68 +1,36 @@
 pragma solidity ^0.4.23;
 
 import './lib/SafeMath.sol';
-import './shared/Ownable.sol';
-import './shared/Pausable.sol';
+import './shared/Administratable.sol';
 
 
 /**
  * @title StorageCostsContract
  * Contract to hold calculate storages and traffic costs
  */
-contract StorageCostsContract is Pausable {
+contract StorageCostsContract is Administratable {
     using SafeMath for uint256;
 
     //value from 8th june 2018
-    //1 DAT = $0,022444
-    uint256 dollarRate = 22444; //remove leading 0
+    //1 DAT = $0,000776
+    uint dollarRate = 776; //remove leading 0 and hold as 10e6
 
-    //set default costs values in milli cents
-    uint costsPerGBData = 500; //values set in cent values
-    uint costsPerGBDownoaded = 100; //values set in cent values
-
-    //define param (isPaused) to decide availability of this version smart contract
-    //isPaused = false : all functions are callable by Datum SDK and will return normal response
-    //isPaused = true  : all functions will return "This version had been deprecated, Please upgrade Datum SDK npm package" about calling from SDK
-
+    //set default costs in DAT/ETH
+    uint costsPerGBData = 5 ether; //values set in cent values
+    uint costsPerGBDownloaded = 100 ether; //values set in cent values
 
     event CoinValueChanged(address sender, uint oldValue, uint newValue);
     event CostsPerGBValueChanged(address sender, uint oldValue, uint newValue);
     event CostsPerGBDownloadedValueChanged(address sender, uint oldValue, uint newValue);
 
-    modifier onlyPausableAdmins() {
-        require(pausableAdmins[msg.sender] == true);
-        _;
-    }
-
     constructor() public {
-        //make owner as a pausableAdmin
-        pausableAdmins[owner] = true;
     }
-
-    /**
-     * @dev Add admins who can execute pause/resume function
-     */
-    function addPausableAdmin(address pausableAdmin) public onlyOwner {
-        pausableAdmins[pausableAdmin] = true;
-    }
-
-    /**
-     * @dev Remove admins who can execute pause/resume function
-     */
-    function removePausableAdmin(address pausableAdmin) public onlyOwner {
-        pausableAdmins[pausableAdmin] = false;
-    }
-
-   
 
     /**
      * @dev Set the actual DAT/USD rate, the value must be provided in 10e6 milli cents, e.g. 1 DAT = $0,022364 --> 22364 micro cents
      * @param value amount of microcents
      */
-    function setCoinDollarRate(uint value) onlyOwner public {
-        //check contract status by checking isPaused param
-        checkStatus();
-
+    function setCoinDollarRate(uint value) onlyAdmins public {
         //hold old value for event
         uint256 oldValue = dollarRate;
 
@@ -74,13 +42,10 @@ contract StorageCostsContract is Pausable {
     }
 
     /**
-     * @dev Set the actual costs for GB stored for 30 days, the value must be provided in cents
+     * @dev Set the actual costs for GB stored for 30 days, the value must be as DAT in (wei), e.g. 5 DAT --> 5000000000000000000
      * @param value amount of cents costs for GB stored
      */
-    function setCostsPerGBDataStored(uint value) onlyOwner public {
-        //check contract status by checking isPaused param
-        checkStatus();
-
+    function setCostsPerGBDataStored(uint value) onlyAdmins public {
         //hold old value for event
         uint oldValue = costsPerGBData;
 
@@ -93,18 +58,15 @@ contract StorageCostsContract is Pausable {
 
 
     /**
-     * @dev Set the actual costs for GB downloaded, the value must be provided in cents
+     * @dev Set the actual costs for GB downloaded, the value must be provided as DAT in (wei), e.g. 5 DAT --> 5000000000000000000
      * @param value amount of cents costs for GB downloaded
      */
-    function setCostsPerGBDataDownloaded(uint value) onlyOwner public {
-        //check contract status by checking isPaused param
-        checkStatus();
-
+    function setCostsPerGBDataDownloaded(uint value) onlyAdmins public {
         //hold old value for event
-        uint oldValue = costsPerGBDownoaded;
+        uint oldValue = costsPerGBDownloaded;
 
         //set new value
-        costsPerGBDownoaded = value;
+        costsPerGBDownloaded = value;
 
         //fire event
         emit CostsPerGBDownloadedValueChanged(msg.sender, oldValue, value);
@@ -115,9 +77,6 @@ contract StorageCostsContract is Pausable {
      * @dev Get actual stored DAT/USD rate in microcents
      */
     function getDollarRate() view public returns (uint) {
-        //check contract status by checking isPaused param
-        checkStatus();
-
         return dollarRate;
     }
 
@@ -127,20 +86,14 @@ contract StorageCostsContract is Pausable {
      * @param size the size of data that will be stored
      * @param duration how long in days the data should be stored
      */
-    function getStorageCosts(uint256 size, uint duration) public constant returns (uint) {
-        //check contract status by checking isPaused param
-        checkStatus();
+    function getStorageCosts(uint256 size, uint duration) public view returns (uint) {
+        //calc costs per day / byte
+        uint256 costsForGB = costsPerGBData;
+        uint256 costsPerDay = costsForGB.div(30);
+        uint256 costsPerDayPerByte = costsPerDay.div(1073741824);
 
-        //rounded to 10e9
-        uint256 costsInDAT = 5 ether / dollarRate * 1000000;
-        uint256 dailyCostsPerGB = costsInDAT.div(30);
-
-        uint GBinBytes = 1024 * 1024 * 1000;
-
-        uint256 costsForStorage = dailyCostsPerGB.mul(duration).div(GBinBytes).mul(size);
-
-        return costsForStorage;
-
+        //return costs for given size and duration
+        return costsPerDayPerByte.mul(duration).mul(size);
     }
 
     /**
@@ -149,16 +102,7 @@ contract StorageCostsContract is Pausable {
      * @param downloads amount of downloads estimated
      */
     function getTrafficCosts(uint256 size, uint downloads) view public returns (uint) {
-        //check contract status by checking isPaused param
-        checkStatus();
-
-        uint256 costsInDAT = 1 ether / dollarRate * 1000000;
-
-        uint GBinBytes = 1024 * 1024 * 1000;
-
-        uint256 costsForDownloads = costsInDAT.div(GBinBytes).mul(size.mul(downloads));
-
-        return costsForDownloads;
+        return costsPerGBDownloaded.div(1073741824).mul(size).mul(downloads);
     }
 
     /**
@@ -166,11 +110,6 @@ contract StorageCostsContract is Pausable {
     * @param estimatedGB amount GB of traffic estimated
     */
     function getTrafficCostsGB(uint256 estimatedGB) view public returns (uint) {
-        //check contract status by checking isPaused param
-        checkStatus();
-
-        uint256 costsInDAT = 1 ether / dollarRate * 1000000;
-        uint256 costsForDownloads = costsInDAT.mul(estimatedGB);
-        return costsForDownloads;
+        return costsPerGBDownloaded.mul(estimatedGB);
     }
 }

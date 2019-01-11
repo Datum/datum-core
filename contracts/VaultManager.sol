@@ -1,14 +1,14 @@
 pragma solidity ^0.4.23;
 
 import './lib/SafeMath.sol';
-import './shared/Operator.sol';
+import './shared/Administratable.sol';
 
 
 /**
  * @title VaultManager
  * Contract to all locked amount and deposits, controlled by parent contract
   */
-contract VaultManager is Operator {
+contract VaultManager is Administratable {
 
      //safe math for all uint256 types
     using SafeMath for uint256;
@@ -47,7 +47,7 @@ contract VaultManager is Operator {
      * @param _address public key address
      * @param _value amount to add
      */
-    function addBalance(address _address, uint256 _value) onlyOperator public
+    function addBalance(address _address, uint256 _value) onlyAdmins public
     {
         lockedAmounts[_address] = lockedAmounts[_address].add(_value);
     }
@@ -57,7 +57,7 @@ contract VaultManager is Operator {
      * @param _address public key address
      * @param _value amount to add
      */
-    function addStorageBalance(address _address, bytes32 _id, uint256 _value) onlyOperator public 
+    function addStorageBalance(address _address, bytes32 _id, uint256 _value) onlyAdmins public 
     {
         storageVault[_id][_address] = storageVault[_id][_address].add(_value);
     }
@@ -67,7 +67,7 @@ contract VaultManager is Operator {
      * @param _address public key address
      * @param _value amount to add
      */
-    function subtractBalance(address _address, uint256 _value) onlyOperator public
+    function subtractBalance(address _address, uint256 _value) onlyAdmins public
     {
         lockedAmounts[_address] = lockedAmounts[_address].sub(_value);
     }
@@ -77,7 +77,7 @@ contract VaultManager is Operator {
      * @param _address public key address
      * @param _value amount to add
      */
-    function subtractStorageBalance(address _address, bytes32 _id, uint256 _value) onlyOperator public
+    function subtractStorageBalance(address _address, bytes32 _id, uint256 _value) onlyAdmins public
     {
         storageVault[_id][_address] = storageVault[_id][_address].sub(_value);
     }
